@@ -90,7 +90,7 @@ PANEL_INFO_CACHE_TTL = 60
 API_RECORDS_PER_POLL = 200
 
 # HTML scrape: curl_cffi impersonate browser version
-HTML_IMPERSONATE = "chrome120"
+HTML_IMPERSONATE = "chrome131"
 
 SETTINGS_CACHE = {}
 SERVICES_CACHE = {}
