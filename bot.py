@@ -11,6 +11,8 @@ import time
 import datetime
 import threading
 import io
+import cloudscraper
+from bs4 import BeautifulSoup
 from collections import OrderedDict
 from functools import wraps
 from typing import Optional, List, Dict, Any, Tuple
@@ -90,7 +92,7 @@ PANEL_INFO_CACHE_TTL = 60
 API_RECORDS_PER_POLL = 200
 
 # HTML scrape: curl_cffi impersonate browser version
-HTML_IMPERSONATE = "chrome131"
+HTML_IMPERSONATE = "chrome124"
 
 SETTINGS_CACHE = {}
 SERVICES_CACHE = {}
@@ -720,10 +722,6 @@ async def fetch_captcha_panel_data(panel_id: str, cfg: dict) -> Tuple[list, str]
 # 🌐 HTML SCRAPE PANEL — Login + Fetch + Parse (curl_cffi)
 # ============================================================
 async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, str]:
-    """Login to HTML panel via curl_cffi (Chrome TLS impersonation) → Cloudflare bypass."""
-    if not HAS_CURL_CFFI:
-        return False, "❌ curl_cffi not installed. Run: pip install curl-cffi"
-
     login_url = (cfg.get("login_url") or "").strip().rstrip("/")
     if not login_url.startswith("http"):
         login_url = "https://" + login_url
@@ -735,34 +733,28 @@ async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[boo
     if not login_url or not email or not password or not live_url:
         return False, "❌ Missing login URL / email / password / live URL"
 
+    # পুরোনো সেশন বন্ধ (যদি থাকে)
     old = HTML_SCRAPE_SESSIONS.pop(panel_id, None)
-    if old:
+    if old and "scraper" in old:
         try:
-            await old["session"].close()
+            await old["scraper"].close()
         except Exception:
             pass
 
-    session = CFFISession(
-        impersonate=HTML_IMPERSONATE,
-        timeout=30,
-        headers={
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+    # cloudscraper ইনস্ট্যান্স তৈরি
+    scraper = cloudscraper.create_scraper(
+        browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
     )
 
     try:
-        res = await session.get(login_url)
-        logger.warning(f"CF_BODY_FULL:\n{res.text[:3000]}")   # লগে পুরোটা দেখুন
-        preview = res.text[:3000].replace("\n", " ")
+        # লগইন পেজ লোড
+        res = await asyncio.to_thread(scraper.get, login_url, timeout=30)
+        preview = res.text[:500].replace("\n", " ")
         logger.info(f"HTML panel {panel_id} login GET status={res.status_code} preview={preview}")
 
         if "checking your browser" in res.text.lower() or "just a moment" in res.text.lower():
-            await session.close()
-            return False, f"❌ Blocked by Cloudflare (still challenge). Preview: {preview[:200]}"
-        if res.status_code in (403, 503):
-            await session.close()
-            return False, f"❌ HTTP {res.status_code} from login page. Preview: {preview[:200]}"
+            await scraper.close()
+            return False, f"❌ Still blocked by Cloudflare. Preview: {preview[:200]}"
 
         soup = BeautifulSoup(res.text, "html.parser")
         csrf = None
@@ -777,31 +769,34 @@ async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[boo
                 csrf = meta.get("content")
 
         if not csrf:
-            await session.close()
+            await scraper.close()
             return False, f"❌ CSRF token not found. Preview: {preview[:200]}"
 
         post_url = login_url + "/login"
         post_data = {"_token": csrf, "email": email, "password": password}
-        login_res = await session.post(post_url, data=post_data)
+        login_res = await asyncio.to_thread(scraper.post, post_url, data=post_data, timeout=30)
         logger.info(f"HTML panel {panel_id} login POST status={login_res.status_code}")
 
-        check_res = await session.get(live_url)
+        # লাইভ পেজ চেক
+        check_res = await asyncio.to_thread(scraper.get, live_url, timeout=30)
         text = check_res.text.lower()
 
         if "sign in" in text and "welcome back" in text and 'name="email"' in text:
-            await session.close()
+            await scraper.close()
             return False, "❌ Login failed — invalid credentials"
         if "checking your browser" in text or "just a moment" in text:
-            await session.close()
+            await scraper.close()
             return False, "❌ Cloudflare challenge on live page after login"
-        if "logout" not in text and "live sms" not in text and "client active sms" not in text and "message stream" not in text:
-            live_preview = (check_res.text or "")[:200].replace("\n", " ")
-            logger.warning(f"HTML panel {panel_id} live preview: {live_preview}")
-            await session.close()
+
+        ok_keywords = ["logout", "live sms", "client active sms", "message stream"]
+        if not any(kw in text for kw in ok_keywords):
+            live_preview = check_res.text[:500].replace("\n", " ")
+            await scraper.close()
             return False, f"❌ Login verify failed. Live preview: {live_preview}"
 
+        # সেশন সংরক্ষণ (এখানে 'scraper' কী ব্যবহার করা হচ্ছে)
         HTML_SCRAPE_SESSIONS[panel_id] = {
-            "session": session,
+            "scraper": scraper,
             "login_url": login_url,
             "live_url": live_url,
             "last_login": time.time(),
@@ -810,11 +805,10 @@ async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[boo
 
     except Exception as e:
         try:
-            await session.close()
+            await scraper.close()
         except Exception:
             pass
         return False, f"❌ Error: {str(e)[:150]}"
-
 
 def parse_html_scrape_rows(html_text: str, cfg: dict) -> list:
     """Parse HTML live-sms page → list of items. Works with Augestel-style markup."""
@@ -876,16 +870,15 @@ def parse_html_scrape_rows(html_text: str, cfg: dict) -> list:
 
 
 async def fetch_html_scrape_items(panel_id: str, cfg: dict) -> Tuple[list, str]:
-    """Fetch live page HTML via curl_cffi + parse. Returns (items, status)."""
     sess = HTML_SCRAPE_SESSIONS.get(panel_id)
-    if not sess:
+    if not sess or "scraper" not in sess:
         return [], "❌ No active session"
 
-    session = sess["session"]
+    scraper = sess["scraper"]
     live_url = sess["live_url"]
 
     try:
-        res = await session.get(live_url)
+        res = await asyncio.to_thread(scraper.get, live_url, timeout=30)
         if res.status_code in (301, 302, 303, 307, 308):
             return [], "❌ Session expired (redirect)"
         if res.status_code in (401, 403):
@@ -6068,7 +6061,7 @@ def main():
 
         for pid, sess in list(HTML_SCRAPE_SESSIONS.items()):
             try:
-                await sess["session"].close()
+                await sess["scraper"].close()
             except Exception:
                 pass
         HTML_SCRAPE_SESSIONS.clear()
