@@ -753,7 +753,8 @@ async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[boo
 
     try:
         res = await session.get(login_url)
-        preview = (res.text or "")[:300].replace("\n", " ")
+        logger.warning(f"CF_BODY_FULL:\n{res.text[:3000]}")   # লগে পুরোটা দেখুন
+        preview = res.text[:3000].replace("\n", " ")
         logger.info(f"HTML panel {panel_id} login GET status={res.status_code} preview={preview}")
 
         if "checking your browser" in res.text.lower() or "just a moment" in res.text.lower():
