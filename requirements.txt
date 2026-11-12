@@ -1,10 +1,9 @@
 python-telegram-bot[rate-limiter]>=21.0
-httpx>=0.27.0
-Flask>=3.0.0
-python-dotenv>=1.0.0
+Flask
+python-dotenv
 supabase==2.23.0
-firebase-admin>=6.5.0
+firebase-admin
 beautifulsoup4==4.12.3
+httpx==0.28.1
 curl-cffi
-cloudflare-skip
 cloudscraper
