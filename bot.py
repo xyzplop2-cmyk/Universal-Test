@@ -1502,7 +1502,7 @@ def delete_api_panel_sync(panel_id: str):
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                asyncio.run_coroutine_threadsafe(old2["session"].close(), loop)
+                asyncio.run_coroutine_threadsafe(old2["scraper"].close(), loop)
         except Exception:
             pass
     HTML_SCRAPE_STATUS.pop(str(panel_id), None)
@@ -5111,7 +5111,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         old = HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)
         if old:
-            try: await old["session"].close()
+            try: await old["scraper"].close()
             except Exception: pass
 
         ok, status = await attempt_html_login(str(panel_id), p, cfg)
@@ -5288,7 +5288,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CAPTCHA_PANEL_STATUS[str(panel_id)] = "🔄 Re-login triggered"
         old2 = HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)
         if old2:
-            try: await old2["session"].close()
+            try: await old2["scraper"].close()
             except Exception: pass
         HTML_SCRAPE_STATUS[str(panel_id)] = "🔄 Re-login triggered"
         await query.answer("Session cleared. Will re-login shortly.", show_alert=True)
@@ -5672,7 +5672,7 @@ async def poll_single_panel(panel_id: str, application: Application,
                     old = HTML_SCRAPE_SESSIONS.pop(panel_id, None)
                     if old:
                         try:
-                            await old["session"].close()
+                            await old["scraper"].close()
                         except Exception:
                             pass
                     logger.info(f"HTML panel {panel_id}: {status} — forcing re-login")
