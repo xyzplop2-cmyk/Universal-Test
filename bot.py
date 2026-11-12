@@ -99,7 +99,7 @@ _PANEL_INFO_CACHE: Dict[str, Dict[str, Any]] = {}
 CAPTCHA_SESSIONS: Dict[str, dict] = {}
 CAPTCHA_PANEL_STATUS: Dict[str, str] = {}
 
-# 🌐 HTML SCRAPE PANEL
+# 🌐 HTML SCRAPE PANEL  ✅ Bug 5 FIXED — HTML_USER_AGENT defined
 HTML_SCRAPE_SESSIONS: Dict[str, dict] = {}
 HTML_SCRAPE_STATUS: Dict[str, str] = {}
 HTML_USER_AGENT = (
@@ -1483,6 +1483,7 @@ def delete_api_panel_sync(panel_id: str):
             pass
     CAPTCHA_PANEL_STATUS.pop(str(panel_id), None)
 
+    # ✅ Bug 1 FIXED: old2 aligned with CAPTCHA_PANEL_STATUS (4 spaces)
     old2 = HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)
     if old2:
         try:
@@ -5071,6 +5072,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ Panel not found.")
             return
 
+        # ✅ Bug 2 FIXED: old assignment correctly indented (8 spaces, aligned with try/except)
         try:
             cfg = json.loads(p.get("mapping_json") or "{}")
         except Exception:
@@ -5628,6 +5630,7 @@ async def poll_single_panel(panel_id: str, application: Application,
                 items, status = await fetch_html_scrape_items(panel_id, cfg)
                 HTML_SCRAPE_STATUS[panel_id] = status
 
+                # ✅ Bug 3 FIXED: status_lower and if aligned (16 spaces)
                 status_lower = status.lower()
                 if ("expired" in status_lower
                         or "error" in status_lower
@@ -6018,6 +6021,7 @@ def main():
                 pass
         CAPTCHA_SESSIONS.clear()
 
+        # ✅ Bug 4 FIXED: for loop correctly indented (8 spaces, aligned with CAPTCHA_SESSIONS.clear())
         for pid, sess in list(HTML_SCRAPE_SESSIONS.items()):
             try:
                 await sess["client"].aclose()
