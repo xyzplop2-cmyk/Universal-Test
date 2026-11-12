@@ -381,29 +381,42 @@ async def run_db(func, *args, **kwargs):
 async def _zenrows_fetch(target_url: str, method: str = "GET",
                          data: dict = None, session_id: str = None) -> str:
     """
-    Fetch a URL via ZenRows API (handles Cloudflare + JS rendering).
-    Raises RuntimeError on failure.
+    Fetch a URL via ZenRows API.
+    ✅ js_render only on GET (POST/PUT will 400 if js_render is sent).
+    ✅ API key sent via X-API-Key header (not in URL).
     """
     if not ZENROWS_API_KEY:
         raise RuntimeError("ZENROWS_API_KEY is not set in environment variables")
 
+    headers = {"X-API-Key": ZENROWS_API_KEY}
     params = {
-        "apikey": ZENROWS_API_KEY,
         "url": target_url,
-        "js_render": "true",
         "premium_proxy": "true",
     }
+
+    # ✅ js_render allowed ONLY for GET
+    if method.upper() == "GET":
+        params["js_render"] = "true"
+
     if session_id:
         params["session_id"] = session_id
 
     async with httpx.AsyncClient(timeout=90) as client:
         if method.upper() == "POST":
-            r = await client.post("https://api.zenrows.com/v1/", params=params, data=data)
+            r = await client.post(
+                "https://api.zenrows.com/v1/",
+                params=params,
+                headers=headers,
+                data=data,
+            )
         else:
-            r = await client.get("https://api.zenrows.com/v1/", params=params)
+            r = await client.get(
+                "https://api.zenrows.com/v1/",
+                params=params,
+                headers=headers,
+            )
         r.raise_for_status()
         return r.text
-
 
 # ============================================================
 # 🔐 AUTO CAPTCHA PANEL — Helpers & Session Store
