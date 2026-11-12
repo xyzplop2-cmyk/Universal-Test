@@ -1,4 +1,4 @@
-# Update V2
+# Update V2 — HTML Scrape Panel Added
 import asyncio
 import logging
 import os
@@ -98,6 +98,15 @@ _PANEL_INFO_CACHE: Dict[str, Dict[str, Any]] = {}
 # 🔐 CAPTCHA PANEL
 CAPTCHA_SESSIONS: Dict[str, dict] = {}
 CAPTCHA_PANEL_STATUS: Dict[str, str] = {}
+
+# 🌐 HTML SCRAPE PANEL
+HTML_SCRAPE_SESSIONS: Dict[str, dict] = {}
+HTML_SCRAPE_STATUS: Dict[str, str] = {}
+HTML_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 # 🔒 FORCE JOIN CACHE
 _FORCE_JOIN_CACHE: Dict[int, float] = {}
@@ -369,9 +378,10 @@ def get_panel_type(panel: dict) -> str:
         return "api"
     try:
         m = json.loads(mj)
-        if isinstance(m, dict) and m.get("_panel_type") == "captcha":
-            return "captcha"
         if isinstance(m, dict):
+            t = m.get("_panel_type")
+            if t in ("captcha", "html_scrape"):
+                return t
             return "custom"
     except Exception:
         pass
@@ -693,6 +703,185 @@ async def fetch_captcha_panel_data(panel_id: str, cfg: dict) -> Tuple[list, str]
 
     except Exception as e:
         return [], f"❌ Fetch error: {str(e)[:80]}"
+
+
+# ============================================================
+# 🌐 HTML SCRAPE PANEL — Login + Fetch + Parse
+# ============================================================
+async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, str]:
+    """Login to HTML panel (form-based, no captcha). Returns (ok, status)."""
+    login_url = (cfg.get("login_url") or "").strip().rstrip("/")
+    if not login_url.startswith("http"):
+        login_url = "https://" + login_url
+
+    email = cfg.get("username", "")
+    password = cfg.get("password", "")
+    live_url = (cfg.get("live_url") or "").strip()
+
+    if not login_url or not email or not password or not live_url:
+        return False, "❌ Missing login URL / email / password / live URL"
+
+    old = HTML_SCRAPE_SESSIONS.pop(panel_id, None)
+    if old:
+        try:
+            await old["client"].aclose()
+        except Exception:
+            pass
+
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(20.0, connect=10.0),
+        follow_redirects=True,
+        headers={
+            "User-Agent": HTML_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        },
+    )
+
+    try:
+        res = await client.get(login_url)
+        if "checking your browser" in res.text.lower():
+            await client.aclose()
+            return False, "❌ Blocked by Cloudflare"
+
+        soup = BeautifulSoup(res.text, "html.parser")
+        csrf = None
+        form = soup.find("form", {"id": "loginForm"}) or soup.find("form")
+        if form:
+            tok = form.find("input", {"name": "_token"})
+            if tok:
+                csrf = tok.get("value")
+        if not csrf:
+            meta = soup.find("meta", {"name": "csrf-token"})
+            if meta:
+                csrf = meta.get("content")
+
+        if not csrf:
+            await client.aclose()
+            return False, "❌ CSRF token not found on login page"
+
+        post_url = login_url + "/login"
+        post_data = {"_token": csrf, "email": email, "password": password}
+        await client.post(post_url, data=post_data)
+
+        check_res = await client.get(live_url)
+        text = check_res.text.lower()
+
+        if "sign in" in text and "welcome back" in text and 'name="email"' in text:
+            await client.aclose()
+            return False, "❌ Login failed — invalid credentials"
+        if "logout" not in text and "live sms" not in text and "client active sms" not in text and "message stream" not in text:
+            await client.aclose()
+            return False, "❌ Login verify failed — live page not accessible"
+
+        HTML_SCRAPE_SESSIONS[panel_id] = {
+            "client": client,
+            "login_url": login_url,
+            "live_url": live_url,
+            "last_login": time.time(),
+        }
+        return True, "✅ Logged in & Active"
+
+    except Exception as e:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        return False, f"❌ Error: {str(e)[:100]}"
+
+
+def parse_html_scrape_rows(html_text: str, cfg: dict) -> list:
+    """Parse HTML live-sms page → list of items. Works with Augestel-style markup."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    items = []
+    seen_ids = set()
+
+    for tr in soup.find_all("tr", attrs={"data-id": True}):
+        data_id = tr.get("data-id", "")
+        if not data_id.startswith("MSG-"):
+            continue
+        if data_id in seen_ids:
+            continue
+        seen_ids.add(data_id)
+
+        num_el = tr.find(attrs={"data-copy-number": True})
+        if not num_el:
+            continue
+        number = (num_el.get("data-copy-number") or "").strip()
+        if not number:
+            continue
+
+        try:
+            epoch_ms = int(data_id.rsplit("-", 1)[-1])
+            dt_iso = datetime.datetime.utcfromtimestamp(epoch_ms / 1000).isoformat() + "Z"
+        except Exception:
+            dt_iso = data_id
+
+        message = ""
+        msg_td = tr.find("td", class_="max-w-xs")
+        if msg_td:
+            span = msg_td.find("span")
+            if span:
+                message = span.get_text(separator=" ", strip=True)
+        if not message:
+            tds_scan = tr.find_all("td")
+            if len(tds_scan) >= 3:
+                message = tds_scan[2].get_text(separator=" ", strip=True)
+        if not message:
+            continue
+
+        sid = ""
+        tds = tr.find_all("td")
+        if len(tds) >= 2:
+            sid_span = tds[1].find("span")
+            if sid_span:
+                sid = sid_span.get_text(strip=True)
+
+        items.append({
+            "num": number,
+            "message": message,
+            "dt": dt_iso,
+            "payout": 1,
+            "cli": sid,
+            "_raw_id": data_id,
+        })
+
+    return items
+
+
+async def fetch_html_scrape_items(panel_id: str, cfg: dict) -> Tuple[list, str]:
+    """Fetch live page HTML + parse. Returns (items, status)."""
+    sess = HTML_SCRAPE_SESSIONS.get(panel_id)
+    if not sess:
+        return [], "❌ No active session"
+
+    client = sess["client"]
+    live_url = sess["live_url"]
+
+    try:
+        res = await client.get(live_url)
+        if res.status_code in (301, 302, 303, 307, 308):
+            return [], "❌ Session expired (redirect)"
+        if res.status_code in (401, 403):
+            return [], f"❌ Access denied ({res.status_code})"
+
+        text = res.text
+        lower = text.lower()
+        if "sign in" in lower and "welcome back" in lower and 'name="email"' in text:
+            return [], "❌ Session expired"
+
+        items = parse_html_scrape_rows(text, cfg)
+        return items, f"✅ {len(items)} item(s) found"
+
+    except httpx.TimeoutException:
+        return [], "❌ Timeout"
+    except Exception as e:
+        return [], f"❌ Fetch error: {str(e)[:100]}"
 
 
 def _get_json_path(obj, path):
@@ -1294,6 +1483,16 @@ def delete_api_panel_sync(panel_id: str):
             pass
     CAPTCHA_PANEL_STATUS.pop(str(panel_id), None)
 
+    old2 = HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)
+    if old2:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.run_coroutine_threadsafe(old2["client"].aclose(), loop)
+        except Exception:
+            pass
+    HTML_SCRAPE_STATUS.pop(str(panel_id), None)
+
 
 def get_setting(key: str, default_val: str = "") -> str:
     if key in SETTINGS_CACHE:
@@ -1316,7 +1515,6 @@ def set_setting(key: str, value: str):
 # 🆕 COUNTRY SHORT-NAME HELPERS
 # ============================================================
 def get_country_short_sync(service: str, country: str) -> str:
-    """Return short-form for a service/country pair. Falls back to country name."""
     if not service or not country:
         return country or ""
     val = get_setting(f"country_short:{service}:{country}", "")
@@ -1720,7 +1918,6 @@ def check_and_process_weekly_reset_sync() -> list:
 
 
 def get_ranking_leaderboard_sync(user_id: int) -> str:
-    """Build leaderboard. User name is clickable ONLY if viewer is admin."""
     now = time.time()
     top_5 = None
     if LEADERBOARD_CACHE["data"] is not None and now - LEADERBOARD_CACHE["ts"] < LEADERBOARD_CACHE_TTL:
@@ -1749,7 +1946,6 @@ def get_ranking_leaderboard_sync(user_id: int) -> str:
     except Exception as e:
         logger.error(f"Supabase user rank error: {e}")
 
-    # 🆕 Only admins can click on user names to open their profile
     viewer_is_admin = is_admin_sync(user_id)
 
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
@@ -2290,7 +2486,6 @@ def build_service_manage_view(service: str):
         for cnt, count in cnts.items():
             payout = get_payout_sync(service, cnt)
             short = get_country_short_sync(service, cnt)
-            # 🆕 Show short name next to full name
             text += f"• **{escape_md(cnt)}** (`{escape_md(short)}`): `{count}` avail | `{fmt_num(payout)} ৳`\n"
     else:
         text += "No countries configured.\n"
@@ -2363,6 +2558,7 @@ def build_api_panels_view():
             [create_button("➕ Connect Standard Panel", callback_data="adm:api:add", style="success")],
             [create_button("🔧 Connect Custom API", callback_data="adm:api:add_custom", style="primary")],
             [create_button("🔐 Connect Captcha Panel", callback_data="adm:api:add_captcha", style="danger")],
+            [create_button("🌐 Connect HTML Scrape Panel", callback_data="adm:api:add_html", style="success")],
         ]
         return text, InlineKeyboardMarkup(buttons)
 
@@ -2373,16 +2569,20 @@ def build_api_panels_view():
         pname = p["name"]
         pinterval = p.get("polling_interval", 5.0)
         p_type = get_panel_type(p)
-        tag = " 🔐" if p_type == "captcha" else (" 🔧" if p_type == "custom" else "")
+        tag = " 🔐" if p_type == "captcha" else (" 🔧" if p_type == "custom" else (" 🌐" if p_type == "html_scrape" else ""))
         text += f"\n🔹 **{escape_md(pname)}**{tag} (Polling: `{pinterval}s`)"
         if p_type == "captcha":
             st = CAPTCHA_PANEL_STATUS.get(str(pid), "⏳ Pending login")
+            text += f"\n   └ `{escape_md(st)}`"
+        elif p_type == "html_scrape":
+            st = HTML_SCRAPE_STATUS.get(str(pid), "⏳ Pending login")
             text += f"\n   └ `{escape_md(st)}`"
         buttons.append([create_button(f"⚙️ {pname}", callback_data=f"adm:api:view:{pid}", style="primary")])
 
     buttons.append([create_button("➕ Connect Standard Panel", callback_data="adm:api:add", style="success")])
     buttons.append([create_button("🔧 Connect Custom API", callback_data="adm:api:add_custom", style="primary")])
     buttons.append([create_button("🔐 Connect Captcha Panel", callback_data="adm:api:add_captcha", style="danger")])
+    buttons.append([create_button("🌐 Connect HTML Scrape Panel", callback_data="adm:api:add_html", style="success")])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -2390,6 +2590,29 @@ def build_panel_manage_view(panel_id: str):
     p = get_api_panel_sync(panel_id)
     if not p:
         return "⚠️ Panel not found.", InlineKeyboardMarkup([[create_button("Back to Panels", callback_data="adm:api:list", style="danger")]])
+
+    if get_panel_type(p) == "html_scrape":
+        try:
+            cfg = json.loads(p.get("mapping_json") or "{}")
+        except Exception:
+            cfg = {}
+        status = HTML_SCRAPE_STATUS.get(str(panel_id), "⏳ Pending login")
+        text = (
+            f"🌐 **HTML SCRAPE PANEL: {escape_md(p['name'])}**\n\n"
+            f"🌐 **Login URL:** `{escape_md(cfg.get('login_url', 'N/A'))}`\n"
+            f"👤 **Email:** `{escape_md(cfg.get('username', 'N/A'))}`\n"
+            f"🔑 **Password:** `******`\n"
+            f"📄 **Live URL:** `{escape_md(cfg.get('live_url', 'N/A'))}`\n"
+            f"⏱️ **Polling:** `{p.get('polling_interval', 10)}s`\n"
+            f"📊 **Status:** `{escape_md(status)}`\n"
+        )
+        buttons = [
+            [create_button("🧪 Test Scrape (Debug)", callback_data=f"adm:api:test_html:{panel_id}", style="primary")],
+            [create_button("🔄 Force Re-Login", callback_data=f"adm:api:relogin:{panel_id}", style="success")],
+            [create_button("🗑️ Delete Panel", callback_data=f"adm:api:delconf:{panel_id}", style="danger")],
+            [create_button("Back to Panels", callback_data="adm:api:list", style="primary")]
+        ]
+        return text, InlineKeyboardMarkup(buttons)
 
     if get_panel_type(p) == "captcha":
         try:
@@ -2756,6 +2979,7 @@ def health():
         "services": len(SERVICES_CACHE),
         "panels": len(PANEL_TASKS),
         "captcha_sessions": len(CAPTCHA_SESSIONS),
+        "html_scrape_sessions": len(HTML_SCRAPE_SESSIONS),
         "batch_rpc": "enabled" if _BATCH_RPC_AVAILABLE else "fallback",
         "firebase": "connected" if firebase_db_ref else "disabled",
         "otp_retention_days": OTP_ID_RETENTION_SECONDS // 86400,
@@ -2792,8 +3016,10 @@ def run_flask():
     WAIT_REFER_PERCENT,
     WAIT_CC_LENGTH,
     WAIT_USER_SEARCH,
-    WAIT_COUNTRY_SHORT,   # 🆕 Country short form state
-) = range(51)
+    WAIT_COUNTRY_SHORT,
+    # 🌐 HTML Scrape Panel States
+    WAIT_HS_NAME, WAIT_HS_LOGIN_URL, WAIT_HS_EMAIL, WAIT_HS_PASSWORD, WAIT_HS_LIVE_URL,
+) = range(56)
 
 
 def admin_only(func):
@@ -2866,8 +3092,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'map_payout_path', 'map_cli_path', 'new_api_interval',
                 'cpt_login_url', 'cpt_username', 'cpt_password', 'cpt_msg_link',
                 'cpt_num_col_name', 'cpt_num_col_idx', 'cpt_msg_col_name',
+                'cpt_msg_col_idx', 'cpt_dt_col_name', 'cpt_dt_col_idx',
                 'fj_chat_id', 'fj_chat_title', 'fj_chat_link', 'cc_length',
-                'country_short'):
+                'country_short',
+                'hs_login_url', 'hs_email', 'hs_password', 'hs_live_url'):
         context.user_data.pop(key, None)
 
     context.user_data['current_menu'] = 'main'
@@ -3496,7 +3724,6 @@ async def receive_service_name(update: Update, context: ContextTypes.DEFAULT_TYP
     return ADD_COUNTRY
 
 
-# 🆕 MODIFIED: Ask for country short form BEFORE payout
 async def receive_country_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     country = update.message.text.strip()
     context.user_data['country_name'] = country
@@ -3522,7 +3749,6 @@ async def receive_country_name(update: Update, context: ContextTypes.DEFAULT_TYP
     return WAIT_COUNTRY_SHORT
 
 
-# 🆕 NEW: Receive country short form, save it, then ask for payout
 async def receive_country_short(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip()
     country = context.user_data.get('country_name', '')
@@ -3650,6 +3876,19 @@ async def admin_add_captcha_panel_start(update: Update, context: ContextTypes.DE
     return WAIT_PANEL_NAME
 
 
+@admin_only
+async def admin_add_html_scrape_panel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['panel_flow'] = 'html_scrape'
+    await update.callback_query.message.reply_text(
+        "🌐 **HTML SCRAPE PANEL SETUP**\n\n"
+        "This panel logs in via HTTP form, then scrapes the live SMS page every ~10 seconds.\n"
+        "No API key needed. Works with any panel that renders SMS rows in HTML.\n\n"
+        "**Step 1/5:** Enter a panel name (e.g., `Augestel`):",
+        parse_mode="Markdown"
+    )
+    return WAIT_HS_NAME
+
+
 async def receive_panel_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['new_api_name'] = update.message.text.strip()
     flow = context.user_data.get('panel_flow')
@@ -3668,9 +3907,87 @@ async def receive_panel_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return WAIT_CPT_LOGIN_URL
 
+    elif flow == 'html_scrape':
+        await update.message.reply_text(
+            "**Step 2/5:** Enter the **Login URL** (e.g., `https://augestel.com/Switchfy`):\n"
+            "⚠️ Do NOT include `/login` at the end — bot adds it automatically.",
+            parse_mode="Markdown"
+        )
+        return WAIT_HS_LOGIN_URL
+
     else:
         await update.message.reply_text("Enter Base API URL (e.g., http://domain.com/viewstasx):")
         return WAIT_PANEL_URL
+
+
+async def receive_hs_login_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+    if url.rstrip("/").endswith("/login"):
+        url = url.rstrip("/")[:-6]
+    context.user_data['hs_login_url'] = url.rstrip("/")
+    await update.message.reply_text(
+        "**Step 3/5:** Enter the login **email / username**:"
+    )
+    return WAIT_HS_EMAIL
+
+
+async def receive_hs_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['hs_email'] = update.message.text.strip()
+    await update.message.reply_text("**Step 4/5:** Enter the **password**:")
+    return WAIT_HS_PASSWORD
+
+
+async def receive_hs_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['hs_password'] = update.message.text.strip()
+    await update.message.reply_text(
+        "**Step 5/5:** Enter the **Live SMS page URL**\n"
+        "Example: `https://augestel.com/Switchfy/client/live-sms`",
+        parse_mode="Markdown"
+    )
+    return WAIT_HS_LIVE_URL
+
+
+async def receive_hs_live_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    if not url.startswith("http"):
+        await update.message.reply_text("❌ URL must start with http:// or https://\nType /cancel to abort.")
+        return WAIT_HS_LIVE_URL
+    context.user_data['hs_live_url'] = url
+
+    cfg = {
+        "_panel_type": "html_scrape",
+        "login_url": context.user_data.get('hs_login_url', ''),
+        "username": context.user_data.get('hs_email', ''),
+        "password": context.user_data.get('hs_password', ''),
+        "live_url": url,
+    }
+    p_name = context.user_data.get('new_api_name', '')
+    p_interval = 10.0
+
+    if p_name and cfg["login_url"]:
+        pid = await run_db(save_api_panel_sync, p_name, cfg["login_url"], "", p_interval, json.dumps(cfg))
+        await update.message.reply_text(
+            f"✅ **HTML Scrape Panel Added!**\n\n"
+            f"📌 Name: `{escape_md(p_name)}`\n"
+            f"🌐 Login: `{escape_md(cfg['login_url'])}`\n"
+            f"👤 User: `{escape_md(cfg['username'])}`\n"
+            f"📄 Live: `{escape_md(cfg['live_url'])}`\n"
+            f"⏱️ Polling: `{p_interval}s`\n\n"
+            f"Bot will login and start scraping shortly.\n"
+            f"Use **🧪 Test Scrape** in panel details to verify.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("❌ Incomplete panel data.")
+
+    for k in ('new_api_name', 'panel_flow', 'hs_login_url', 'hs_email', 'hs_password', 'hs_live_url'):
+        context.user_data.pop(k, None)
+
+    text_msg, kbd = build_api_panels_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
 
 
 async def receive_panel_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4165,7 +4482,7 @@ async def set_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
-    if not (new_link.startswith("http://") or new_link.startswith("https://") or new_link.startswith("t.me/") or new_link.startswith("@")):
+    if not (new_link.startswith("http://") or new_link.startswith("https://") or new_link.startswith("t.me/") or new_link.startswith("@") or new_link.startswith("@")):
         await update.message.reply_text("❌ Invalid link! Please enter a valid URL or Telegram username.\nType /cancel to abort.")
         return WAIT_CHANNEL
     await run_db(set_setting, "channel", new_link)
@@ -4218,7 +4535,6 @@ async def set_otpgroupid_start(update: Update, context: ContextTypes.DEFAULT_TYP
     if update.callback_query:
         await update.callback_query.message.reply_text("Enter the OTP Forward Group Chat ID (e.g., -1001234567890):")
     return WAIT_OTP_GROUP_ID
-
 
 
 async def receive_otp_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4317,7 +4633,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'cpt_num_col_name', 'cpt_num_col_idx', 'cpt_msg_col_name',
                 'cpt_msg_col_idx', 'cpt_dt_col_name', 'cpt_dt_col_idx',
                 'fj_chat_id', 'fj_chat_title', 'fj_chat_link', 'cc_length',
-                'country_short'):
+                'country_short',
+                'hs_login_url', 'hs_email', 'hs_password', 'hs_live_url'):
         context.user_data.pop(key, None)
 
     if update.message and update.message.text:
@@ -4745,6 +5062,71 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, kbd = await run_db(build_panel_manage_view, panel_id)
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
+    elif data.startswith("adm:api:test_html:"):
+        if not user_is_admin: await query.answer(); return
+        await query.answer("Testing scrape...")
+        panel_id = data.split(":", 3)[3]
+        p = await run_db(get_api_panel_sync, panel_id)
+        if not p:
+            await query.edit_message_text("⚠️ Panel not found.")
+            return
+
+        try:
+            cfg = json.loads(p.get("mapping_json") or "{}")
+        except Exception:
+            cfg = {}
+
+        old = HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)
+        if old:
+            try: await old["client"].aclose()
+            except Exception: pass
+
+        ok, status = await attempt_html_login(str(panel_id), p, cfg)
+        if not ok:
+            HTML_SCRAPE_STATUS[str(panel_id)] = status
+            kbd = InlineKeyboardMarkup([[
+                create_button("Back", callback_data=f"adm:api:view:{panel_id}", style="primary")
+            ]])
+            await query.edit_message_text(
+                f"❌ <b>Login Failed</b>\n\n<code>{html.escape(status)}</code>\n\n"
+                f"<b>Login URL:</b> <code>{html.escape(cfg.get('login_url',''))}</code>\n"
+                f"<b>Live URL:</b> <code>{html.escape(cfg.get('live_url',''))}</code>",
+                reply_markup=kbd, parse_mode="HTML"
+            )
+            return
+
+        items, fetch_status = await fetch_html_scrape_items(str(panel_id), cfg)
+        HTML_SCRAPE_STATUS[str(panel_id)] = fetch_status
+
+        preview = ""
+        for i, it in enumerate(items[:5], 1):
+            otp_code = extract_otp(it["message"])
+            preview += (
+                f"\n<b>{i}.</b> 📱 <code>{html.escape(it['num'])}</code> "
+                f"| <b>{html.escape(it.get('cli', '') or '-')}</b>\n"
+                f"   🔐 OTP: <code>{html.escape(otp_code)}</code>\n"
+                f"   💬 <code>{html.escape(it['message'][:100])}</code>\n"
+                f"   🆔 <code>{html.escape(it.get('_raw_id','')[:30])}</code>\n"
+            )
+        if not preview:
+            preview = (
+                "\n<i>No rows found.</i>\n"
+                f"<b>Live URL:</b> <code>{html.escape(cfg.get('live_url',''))}</code>\n"
+                f"<b>Login URL:</b> <code>{html.escape(cfg.get('login_url',''))}</code>\n"
+                "Check that the Live URL is the actual SMS page and not a redirect."
+            )
+
+        kbd = InlineKeyboardMarkup([[
+            create_button("Back", callback_data=f"adm:api:view:{panel_id}", style="primary")
+        ]])
+        await query.edit_message_text(
+            f"✅ <b>Scrape OK</b>\n"
+            f"Status: <code>{html.escape(fetch_status)}</code>\n"
+            f"Total: <b>{len(items)}</b> items\n"
+            f"{preview}",
+            reply_markup=kbd, parse_mode="HTML"
+        )
+
     elif data.startswith("adm:api:test:"):
         if not user_is_admin: await query.answer(); return
         await query.answer("Fetching...")
@@ -4868,8 +5250,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: await old["client"].aclose()
             except Exception: pass
         CAPTCHA_PANEL_STATUS[str(panel_id)] = "🔄 Re-login triggered"
+        old2 = HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)
+        if old2:
+            try: await old2["client"].aclose()
+            except Exception: pass
+        HTML_SCRAPE_STATUS[str(panel_id)] = "🔄 Re-login triggered"
         await query.answer("Session cleared. Will re-login shortly.", show_alert=True)
-        text, kbd = build_panel_manage_view(str(panel_id))
+        text, kbd = await run_db(build_panel_manage_view, str(panel_id))
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:api:delconf:"):
@@ -4996,6 +5383,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _compute_msg_id(item: dict) -> Optional[str]:
     try:
+        raw_id = item.get("_raw_id")
+        if raw_id:
+            return str(raw_id)
         num = str(item.get("num", "")).strip()
         dt = item.get("dt", "")
         msg = item.get("message", "")
@@ -5031,17 +5421,6 @@ def _filter_new_items(items: list, processed_ids: TimedLRUDict) -> Tuple[list, l
     return valid, new_ids
 
 
-# ============================================================
-# 🆕 process_otp_items_fast — NEW OTP Group message format
-#    Format:
-#        {ShortCountry} › {CLI Name}
-#
-#        ☎️ Number: {masked}
-#        ━━━━━━━━━━━━━━━━━
-#        [🗨️ SMS: {message}]   (if show_message on)
-#        ━━━━━━━━━━━━━━━━━
-#        🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {name} ({link})
-# ============================================================
 async def process_otp_items_fast(items: list, application: Application):
     if not items:
         return
@@ -5053,7 +5432,6 @@ async def process_otp_items_fast(items: list, application: Application):
     show_dev_enabled = get_setting("show_developer", "true") == "true"
     dev_username = get_setting("dev_username", "developer")
     dev_link = clean_tg_link(get_setting("dev_link", "https://t.me/developer"))
-    # 🆕 Developer display: clickable name + visible link in parens
     dev_html = f'<a href="{dev_link}">{html.escape(dev_username)}</a>'
     target_otp_group = get_setting("otp_group_id", OTP_GROUP_ID)
 
@@ -5132,7 +5510,6 @@ async def process_otp_items_fast(items: list, application: Application):
             cli = (item.get("cli") or "").strip()
             display_service = cli if cli else (alloc.get("service") or "Service")
 
-            # 🆕 Short country name from settings (falls back to full country)
             short_country = get_country_short_sync(alloc["service"], alloc["country"])
 
             otp_code = extract_otp(msg)
@@ -5143,7 +5520,6 @@ async def process_otp_items_fast(items: list, application: Application):
             safe_masked_num = html.escape(mask_number_aph(num))
             payout_str = fmt_num(item_payout)
 
-            # ── OTP Group message (NEW FORMAT) ──
             if target_otp_group:
                 divider = "━━━━━━━━━━━━━━━━━"
                 if show_msg_enabled:
@@ -5177,7 +5553,6 @@ async def process_otp_items_fast(items: list, application: Application):
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                 ))
 
-            # ── User DM message (unchanged) ──
             if show_msg_enabled:
                 user_text = (
                     "— — — — — — — — — —\n"
@@ -5234,6 +5609,60 @@ async def poll_single_panel(panel_id: str, application: Application,
                 interval = 3.1
             elif interval > 120.0:
                 interval = 120.0
+
+            if get_panel_type(panel) == "html_scrape":
+                try:
+                    cfg = json.loads(panel.get("mapping_json") or "{}")
+                except Exception:
+                    cfg = {}
+
+                sess = HTML_SCRAPE_SESSIONS.get(panel_id)
+                if not sess:
+                    ok, status = await attempt_html_login(panel_id, panel, cfg)
+                    HTML_SCRAPE_STATUS[panel_id] = status
+                    if not ok:
+                        logger.info(f"HTML panel {panel_id}: {status}")
+                        await asyncio.sleep(30)
+                        continue
+
+                items, status = await fetch_html_scrape_items(panel_id, cfg)
+                HTML_SCRAPE_STATUS[panel_id] = status
+
+                status_lower = status.lower()
+                if ("expired" in status_lower
+                        or "error" in status_lower
+                        or "redirect" in status_lower
+                        or "denied" in status_lower):
+                    old = HTML_SCRAPE_SESSIONS.pop(panel_id, None)
+                    if old:
+                        try:
+                            await old["client"].aclose()
+                        except Exception:
+                            pass
+                    logger.info(f"HTML panel {panel_id}: {status} — forcing re-login")
+                    await asyncio.sleep(5)
+                    continue
+
+                if items:
+                    new_items, new_ids = _filter_new_items(items, processed_ids)
+                    if new_items:
+                        logger.info(f"HTML Scrape Panel {panel_id}: {len(new_items)} new items → delivering")
+                        try:
+                            await run_db(mark_otp_seen_batch_sync, new_ids)
+                        except Exception as e:
+                            for mid in new_ids:
+                                processed_ids.pop(mid, None)
+                            logger.error(f"mark_otp_seen failed, rolled back {len(new_ids)}: {e}")
+                        else:
+                            async def _safe_process_html(it, app):
+                                try:
+                                    await process_otp_items_fast(it, app)
+                                except Exception as e:
+                                    logger.exception(f"process_otp_items_fast CRASHED: {e}")
+                            asyncio.create_task(_safe_process_html(new_items, application))
+
+                await asyncio.sleep(interval)
+                continue
 
             if get_panel_type(panel) == "captcha":
                 try:
@@ -5462,6 +5891,7 @@ def main():
             CallbackQueryHandler(admin_add_panel_start, pattern="^adm:api:add$"),
             CallbackQueryHandler(admin_add_custom_panel_start, pattern="^adm:api:add_custom$"),
             CallbackQueryHandler(admin_add_captcha_panel_start, pattern="^adm:api:add_captcha$"),
+            CallbackQueryHandler(admin_add_html_scrape_panel_start, pattern="^adm:api:add_html$"),
             CallbackQueryHandler(admin_add_admin_start, pattern="^adm:add:start$"),
             CallbackQueryHandler(set_channel_start, pattern="^adm:set:channel$"),
             CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
@@ -5485,7 +5915,6 @@ def main():
         states={
             ADD_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_service_name)],
             ADD_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_country_name)],
-            # 🆕 NEW: country short form is asked right after country name
             WAIT_COUNTRY_SHORT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_country_short)],
             WAIT_PAYOUT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_payout_amount)],
             WAIT_CC_LENGTH: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_cc_length)],
@@ -5535,6 +5964,12 @@ def main():
             WAIT_FJ_CHAT_TYPE: [CallbackQueryHandler(handle_fj_chat_type, pattern="^adm:fj_type:")],
             WAIT_REFER_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_refer_pct)],
             WAIT_USER_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_user_search)],
+            # 🌐 HTML Scrape Panel States
+            WAIT_HS_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_panel_name)],
+            WAIT_HS_LOGIN_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_hs_login_url)],
+            WAIT_HS_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_hs_email)],
+            WAIT_HS_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_hs_password)],
+            WAIT_HS_LIVE_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_hs_live_url)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
@@ -5582,6 +6017,14 @@ def main():
             except Exception:
                 pass
         CAPTCHA_SESSIONS.clear()
+
+        for pid, sess in list(HTML_SCRAPE_SESSIONS.items()):
+            try:
+                await sess["client"].aclose()
+            except Exception:
+                pass
+        HTML_SCRAPE_SESSIONS.clear()
+
         try:
             await asyncio.to_thread(push_dirty_to_firebase_sync)
             logger.info("Final Firebase backup complete")
