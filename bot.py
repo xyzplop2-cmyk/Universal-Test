@@ -1,4 +1,4 @@
-# Update V2 — HTML Scrape Panel Added
+# Update V3 — HTML Scrape Panel + curl_cffi Cloudflare Bypass
 import asyncio
 import logging
 import os
@@ -21,6 +21,14 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from supabase.lib.client_options import ClientOptions as SupabaseClientOptions
+
+# ✅ NEW: curl_cffi for Cloudflare bypass
+try:
+    from curl_cffi.requests import AsyncSession as CFFISession
+    HAS_CURL_CFFI = True
+except ImportError:
+    CFFISession = None
+    HAS_CURL_CFFI = False
 
 try:
     import firebase_admin
@@ -81,6 +89,9 @@ API_FETCH_TIMEOUT = 8.0
 PANEL_INFO_CACHE_TTL = 60
 API_RECORDS_PER_POLL = 200
 
+# HTML scrape: curl_cffi impersonate browser version
+HTML_IMPERSONATE = "chrome120"
+
 SETTINGS_CACHE = {}
 SERVICES_CACHE = {}
 PAYOUTS_CACHE = {}
@@ -99,7 +110,7 @@ _PANEL_INFO_CACHE: Dict[str, Dict[str, Any]] = {}
 CAPTCHA_SESSIONS: Dict[str, dict] = {}
 CAPTCHA_PANEL_STATUS: Dict[str, str] = {}
 
-# 🌐 HTML SCRAPE PANEL  ✅ Bug 5 FIXED — HTML_USER_AGENT defined
+# 🌐 HTML SCRAPE PANEL
 HTML_SCRAPE_SESSIONS: Dict[str, dict] = {}
 HTML_SCRAPE_STATUS: Dict[str, str] = {}
 HTML_USER_AGENT = (
@@ -706,10 +717,13 @@ async def fetch_captcha_panel_data(panel_id: str, cfg: dict) -> Tuple[list, str]
 
 
 # ============================================================
-# 🌐 HTML SCRAPE PANEL — Login + Fetch + Parse
+# 🌐 HTML SCRAPE PANEL — Login + Fetch + Parse (curl_cffi)
 # ============================================================
 async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, str]:
-    """Login to HTML panel (form-based, no captcha). Returns (ok, status)."""
+    """Login to HTML panel via curl_cffi (Chrome TLS impersonation) → Cloudflare bypass."""
+    if not HAS_CURL_CFFI:
+        return False, "❌ curl_cffi not installed. Run: pip install curl-cffi"
+
     login_url = (cfg.get("login_url") or "").strip().rstrip("/")
     if not login_url.startswith("http"):
         login_url = "https://" + login_url
@@ -724,30 +738,30 @@ async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[boo
     old = HTML_SCRAPE_SESSIONS.pop(panel_id, None)
     if old:
         try:
-            await old["client"].aclose()
+            await old["session"].close()
         except Exception:
             pass
 
-    client = httpx.AsyncClient(
-        timeout=httpx.Timeout(20.0, connect=10.0),
-        follow_redirects=True,
+    session = CFFISession(
+        impersonate=HTML_IMPERSONATE,
+        timeout=30,
         headers={
-            "User-Agent": HTML_USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
         },
     )
 
     try:
-        res = await client.get(login_url)
-        if "checking your browser" in res.text.lower():
-            await client.aclose()
-            return False, "❌ Blocked by Cloudflare"
+        res = await session.get(login_url)
+        preview = (res.text or "")[:300].replace("\n", " ")
+        logger.info(f"HTML panel {panel_id} login GET status={res.status_code} preview={preview}")
+
+        if "checking your browser" in res.text.lower() or "just a moment" in res.text.lower():
+            await session.close()
+            return False, f"❌ Blocked by Cloudflare (still challenge). Preview: {preview[:200]}"
+        if res.status_code in (403, 503):
+            await session.close()
+            return False, f"❌ HTTP {res.status_code} from login page. Preview: {preview[:200]}"
 
         soup = BeautifulSoup(res.text, "html.parser")
         csrf = None
@@ -762,25 +776,31 @@ async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[boo
                 csrf = meta.get("content")
 
         if not csrf:
-            await client.aclose()
-            return False, "❌ CSRF token not found on login page"
+            await session.close()
+            return False, f"❌ CSRF token not found. Preview: {preview[:200]}"
 
         post_url = login_url + "/login"
         post_data = {"_token": csrf, "email": email, "password": password}
-        await client.post(post_url, data=post_data)
+        login_res = await session.post(post_url, data=post_data)
+        logger.info(f"HTML panel {panel_id} login POST status={login_res.status_code}")
 
-        check_res = await client.get(live_url)
+        check_res = await session.get(live_url)
         text = check_res.text.lower()
 
         if "sign in" in text and "welcome back" in text and 'name="email"' in text:
-            await client.aclose()
+            await session.close()
             return False, "❌ Login failed — invalid credentials"
+        if "checking your browser" in text or "just a moment" in text:
+            await session.close()
+            return False, "❌ Cloudflare challenge on live page after login"
         if "logout" not in text and "live sms" not in text and "client active sms" not in text and "message stream" not in text:
-            await client.aclose()
-            return False, "❌ Login verify failed — live page not accessible"
+            live_preview = (check_res.text or "")[:200].replace("\n", " ")
+            logger.warning(f"HTML panel {panel_id} live preview: {live_preview}")
+            await session.close()
+            return False, f"❌ Login verify failed. Live preview: {live_preview}"
 
         HTML_SCRAPE_SESSIONS[panel_id] = {
-            "client": client,
+            "session": session,
             "login_url": login_url,
             "live_url": live_url,
             "last_login": time.time(),
@@ -789,10 +809,10 @@ async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[boo
 
     except Exception as e:
         try:
-            await client.aclose()
+            await session.close()
         except Exception:
             pass
-        return False, f"❌ Error: {str(e)[:100]}"
+        return False, f"❌ Error: {str(e)[:150]}"
 
 
 def parse_html_scrape_rows(html_text: str, cfg: dict) -> list:
@@ -855,16 +875,16 @@ def parse_html_scrape_rows(html_text: str, cfg: dict) -> list:
 
 
 async def fetch_html_scrape_items(panel_id: str, cfg: dict) -> Tuple[list, str]:
-    """Fetch live page HTML + parse. Returns (items, status)."""
+    """Fetch live page HTML via curl_cffi + parse. Returns (items, status)."""
     sess = HTML_SCRAPE_SESSIONS.get(panel_id)
     if not sess:
         return [], "❌ No active session"
 
-    client = sess["client"]
+    session = sess["session"]
     live_url = sess["live_url"]
 
     try:
-        res = await client.get(live_url)
+        res = await session.get(live_url)
         if res.status_code in (301, 302, 303, 307, 308):
             return [], "❌ Session expired (redirect)"
         if res.status_code in (401, 403):
@@ -874,14 +894,14 @@ async def fetch_html_scrape_items(panel_id: str, cfg: dict) -> Tuple[list, str]:
         lower = text.lower()
         if "sign in" in lower and "welcome back" in lower and 'name="email"' in text:
             return [], "❌ Session expired"
+        if "checking your browser" in lower or "just a moment" in lower:
+            return [], "❌ Cloudflare challenge on live page"
 
         items = parse_html_scrape_rows(text, cfg)
         return items, f"✅ {len(items)} item(s) found"
 
-    except httpx.TimeoutException:
-        return [], "❌ Timeout"
     except Exception as e:
-        return [], f"❌ Fetch error: {str(e)[:100]}"
+        return [], f"❌ Fetch error: {str(e)[:150]}"
 
 
 def _get_json_path(obj, path):
@@ -1483,13 +1503,12 @@ def delete_api_panel_sync(panel_id: str):
             pass
     CAPTCHA_PANEL_STATUS.pop(str(panel_id), None)
 
-    # ✅ Bug 1 FIXED: old2 aligned with CAPTCHA_PANEL_STATUS (4 spaces)
     old2 = HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)
     if old2:
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                asyncio.run_coroutine_threadsafe(old2["client"].aclose(), loop)
+                asyncio.run_coroutine_threadsafe(old2["session"].close(), loop)
         except Exception:
             pass
     HTML_SCRAPE_STATUS.pop(str(panel_id), None)
@@ -2598,6 +2617,7 @@ def build_panel_manage_view(panel_id: str):
         except Exception:
             cfg = {}
         status = HTML_SCRAPE_STATUS.get(str(panel_id), "⏳ Pending login")
+        engine = f"curl_cffi ({HTML_IMPERSONATE})" if HAS_CURL_CFFI else "❌ curl_cffi NOT installed"
         text = (
             f"🌐 **HTML SCRAPE PANEL: {escape_md(p['name'])}**\n\n"
             f"🌐 **Login URL:** `{escape_md(cfg.get('login_url', 'N/A'))}`\n"
@@ -2605,6 +2625,7 @@ def build_panel_manage_view(panel_id: str):
             f"🔑 **Password:** `******`\n"
             f"📄 **Live URL:** `{escape_md(cfg.get('live_url', 'N/A'))}`\n"
             f"⏱️ **Polling:** `{p.get('polling_interval', 10)}s`\n"
+            f"🚀 **Engine:** `{engine}`\n"
             f"📊 **Status:** `{escape_md(status)}`\n"
         )
         buttons = [
@@ -2988,6 +3009,8 @@ def health():
         "chat_locks": len(_CHAT_LOCKS),
         "force_join_enabled": is_force_join_enabled(),
         "refer_enabled": get_setting("refer_enabled", "true") == "true",
+        "curl_cffi": "enabled" if HAS_CURL_CFFI else "disabled",
+        "html_impersonate": HTML_IMPERSONATE,
     })
 
 
@@ -3880,10 +3903,12 @@ async def admin_add_captcha_panel_start(update: Update, context: ContextTypes.DE
 @admin_only
 async def admin_add_html_scrape_panel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['panel_flow'] = 'html_scrape'
+    cf_status = "🟢 curl_cffi ready (Cloudflare bypass)" if HAS_CURL_CFFI else "🔴 curl_cffi NOT installed — run: pip install curl-cffi"
     await update.callback_query.message.reply_text(
         "🌐 **HTML SCRAPE PANEL SETUP**\n\n"
-        "This panel logs in via HTTP form, then scrapes the live SMS page every ~10 seconds.\n"
-        "No API key needed. Works with any panel that renders SMS rows in HTML.\n\n"
+        "This panel logs in via HTTP form (using curl_cffi Chrome impersonation → bypasses Cloudflare),\n"
+        "then scrapes the live SMS page every ~10 seconds.\n\n"
+        f"🚀 **Engine Status:** {cf_status}\n\n"
         "**Step 1/5:** Enter a panel name (e.g., `Augestel`):",
         parse_mode="Markdown"
     )
@@ -3969,13 +3994,15 @@ async def receive_hs_live_url(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if p_name and cfg["login_url"]:
         pid = await run_db(save_api_panel_sync, p_name, cfg["login_url"], "", p_interval, json.dumps(cfg))
+        engine = f"curl_cffi ({HTML_IMPERSONATE})" if HAS_CURL_CFFI else "❌ curl_cffi not installed"
         await update.message.reply_text(
             f"✅ **HTML Scrape Panel Added!**\n\n"
             f"📌 Name: `{escape_md(p_name)}`\n"
             f"🌐 Login: `{escape_md(cfg['login_url'])}`\n"
             f"👤 User: `{escape_md(cfg['username'])}`\n"
             f"📄 Live: `{escape_md(cfg['live_url'])}`\n"
-            f"⏱️ Polling: `{p_interval}s`\n\n"
+            f"⏱️ Polling: `{p_interval}s`\n"
+            f"🚀 Engine: `{engine}`\n\n"
             f"Bot will login and start scraping shortly.\n"
             f"Use **🧪 Test Scrape** in panel details to verify.",
             parse_mode="Markdown"
@@ -5065,14 +5092,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("adm:api:test_html:"):
         if not user_is_admin: await query.answer(); return
-        await query.answer("Testing scrape...")
+        await query.answer("Testing scrape via curl_cffi...")
         panel_id = data.split(":", 3)[3]
         p = await run_db(get_api_panel_sync, panel_id)
         if not p:
             await query.edit_message_text("⚠️ Panel not found.")
             return
 
-        # ✅ Bug 2 FIXED: old assignment correctly indented (8 spaces, aligned with try/except)
+        if not HAS_CURL_CFFI:
+            await query.edit_message_text(
+                "❌ <b>curl_cffi not installed!</b>\n\n"
+                "Cloudflare bypass requires curl_cffi.\n"
+                "Run this on your server:\n"
+                "<code>pip install curl-cffi</code>\n"
+                "Then restart the bot.",
+                parse_mode="HTML"
+            )
+            return
+
         try:
             cfg = json.loads(p.get("mapping_json") or "{}")
         except Exception:
@@ -5080,7 +5117,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         old = HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)
         if old:
-            try: await old["client"].aclose()
+            try: await old["session"].close()
             except Exception: pass
 
         ok, status = await attempt_html_login(str(panel_id), p, cfg)
@@ -5090,9 +5127,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 create_button("Back", callback_data=f"adm:api:view:{panel_id}", style="primary")
             ]])
             await query.edit_message_text(
-                f"❌ <b>Login Failed</b>\n\n<code>{html.escape(status)}</code>\n\n"
+                f"❌ <b>Login Failed</b>\n\n"
+                f"<b>Status:</b>\n<pre>{html.escape(status[:1500])}</pre>\n\n"
                 f"<b>Login URL:</b> <code>{html.escape(cfg.get('login_url',''))}</code>\n"
-                f"<b>Live URL:</b> <code>{html.escape(cfg.get('live_url',''))}</code>",
+                f"<b>Live URL:</b> <code>{html.escape(cfg.get('live_url',''))}</code>\n"
+                f"<b>Engine:</b> curl_cffi ({HTML_IMPERSONATE})",
                 reply_markup=kbd, parse_mode="HTML"
             )
             return
@@ -5125,6 +5164,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ <b>Scrape OK</b>\n"
             f"Status: <code>{html.escape(fetch_status)}</code>\n"
             f"Total: <b>{len(items)}</b> items\n"
+            f"Engine: curl_cffi ({HTML_IMPERSONATE})\n"
             f"{preview}",
             reply_markup=kbd, parse_mode="HTML"
         )
@@ -5254,7 +5294,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CAPTCHA_PANEL_STATUS[str(panel_id)] = "🔄 Re-login triggered"
         old2 = HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)
         if old2:
-            try: await old2["client"].aclose()
+            try: await old2["session"].close()
             except Exception: pass
         HTML_SCRAPE_STATUS[str(panel_id)] = "🔄 Re-login triggered"
         await query.answer("Session cleared. Will re-login shortly.", show_alert=True)
@@ -5630,7 +5670,6 @@ async def poll_single_panel(panel_id: str, application: Application,
                 items, status = await fetch_html_scrape_items(panel_id, cfg)
                 HTML_SCRAPE_STATUS[panel_id] = status
 
-                # ✅ Bug 3 FIXED: status_lower and if aligned (16 spaces)
                 status_lower = status.lower()
                 if ("expired" in status_lower
                         or "error" in status_lower
@@ -5639,7 +5678,7 @@ async def poll_single_panel(panel_id: str, application: Application,
                     old = HTML_SCRAPE_SESSIONS.pop(panel_id, None)
                     if old:
                         try:
-                            await old["client"].aclose()
+                            await old["session"].close()
                         except Exception:
                             pass
                     logger.info(f"HTML panel {panel_id}: {status} — forcing re-login")
@@ -5877,6 +5916,11 @@ def main():
 
     load_known_users()
 
+    if HAS_CURL_CFFI:
+        logger.info(f"curl_cffi loaded — HTML scrape will use {HTML_IMPERSONATE} TLS impersonation")
+    else:
+        logger.warning("curl_cffi NOT installed — HTML scrape Cloudflare bypass disabled. Run: pip install curl-cffi")
+
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info(f"Flask started on port {os.environ.get('PORT', 8080)}")
 
@@ -6021,10 +6065,9 @@ def main():
                 pass
         CAPTCHA_SESSIONS.clear()
 
-        # ✅ Bug 4 FIXED: for loop correctly indented (8 spaces, aligned with CAPTCHA_SESSIONS.clear())
         for pid, sess in list(HTML_SCRAPE_SESSIONS.items()):
             try:
-                await sess["client"].aclose()
+                await sess["session"].close()
             except Exception:
                 pass
         HTML_SCRAPE_SESSIONS.clear()
