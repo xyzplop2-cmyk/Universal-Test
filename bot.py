@@ -379,11 +379,14 @@ async def run_db(func, *args, **kwargs):
 # ✅ ZENROWS CLOUDFLARE BYPASS — Helper
 # ============================================================
 async def _zenrows_fetch(target_url: str, method: str = "GET",
-                         data: dict = None, session_id: str = None) -> str:
+                         data: dict = None, session_id: str = None,
+                         extra_cookies: str = None) -> Tuple[str, str]:
     """
-    Fetch a URL via ZenRows API.
-    ✅ js_render only on GET (POST/PUT will 400 if js_render is sent).
-    ✅ API key sent via X-API-Key header (not in URL).
+    Fetch via ZenRows. Returns (text, cookies_header).
+    ✅ js_render only on GET.
+    ✅ API key in header.
+    ✅ Captures Zr-Cookies header for session continuity.
+    ✅ Timeout raised to 180s.
     """
     if not ZENROWS_API_KEY:
         raise RuntimeError("ZENROWS_API_KEY is not set in environment variables")
@@ -394,14 +397,17 @@ async def _zenrows_fetch(target_url: str, method: str = "GET",
         "premium_proxy": "true",
     }
 
-    # ✅ js_render allowed ONLY for GET
     if method.upper() == "GET":
         params["js_render"] = "true"
 
     if session_id:
         params["session_id"] = session_id
 
-    async with httpx.AsyncClient(timeout=90) as client:
+    # Forward cookies from previous response (if any)
+    if extra_cookies:
+        headers["Cookie"] = extra_cookies
+
+    async with httpx.AsyncClient(timeout=180) as client:  # ✅ 180s timeout
         if method.upper() == "POST":
             r = await client.post(
                 "https://api.zenrows.com/v1/",
@@ -416,7 +422,10 @@ async def _zenrows_fetch(target_url: str, method: str = "GET",
                 headers=headers,
             )
         r.raise_for_status()
-        return r.text
+
+        # ✅ Capture ZenRows cookies for session persistence
+        cookies_header = r.headers.get("Zr-Cookies", "")
+        return r.text, cookies_header
 
 # ============================================================
 # 🔐 AUTO CAPTCHA PANEL — Helpers & Session Store
@@ -758,7 +767,6 @@ async def fetch_captcha_panel_data(panel_id: str, cfg: dict) -> Tuple[list, str]
 # 🌐 HTML SCRAPE PANEL — Login + Fetch + Parse (ZenRows)
 # ============================================================
 async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, str]:
-    """Login to HTML panel via ZenRows (handles Cloudflare + JS rendering)."""
     login_url = (cfg.get("login_url") or "").strip().rstrip("/")
     if not login_url.startswith("http"):
         login_url = "https://" + login_url
@@ -773,15 +781,15 @@ async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[boo
     if not ZENROWS_API_KEY:
         return False, "❌ ZENROWS_API_KEY not set in environment variables"
 
-    # Purge old session for this panel
     HTML_SCRAPE_SESSIONS.pop(panel_id, None)
 
-    # Generate a stable session ID so ZenRows reuses cookies across requests
     session_id = f"panel-{panel_id}-{int(time.time())}"
 
     try:
-        # Step 1: GET login page via ZenRows (bypasses Cloudflare)
-        html_text = await _zenrows_fetch(login_url, method="GET", session_id=session_id)
+        # Step 1: GET login page and capture cookies
+        html_text, cf_cookies = await _zenrows_fetch(
+            login_url, method="GET", session_id=session_id
+        )
         soup = BeautifulSoup(html_text, "html.parser")
 
         # Find CSRF token
@@ -800,13 +808,24 @@ async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[boo
             preview = html_text[:300].replace("\n", " ")
             return False, f"❌ CSRF token not found. Preview: {preview}"
 
-        # Step 2: POST login form via ZenRows (same session_id → same cookies)
+        # Step 2: POST login form WITH the cookies from Step 1
         post_url = login_url + "/login"
         post_data = {"_token": csrf, "email": email, "password": password}
-        await _zenrows_fetch(post_url, method="POST", data=post_data, session_id=session_id)
+        await _zenrows_fetch(
+            post_url,
+            method="POST",
+            data=post_data,
+            session_id=session_id,
+            extra_cookies=cf_cookies,  # ✅ Forward cookies
+        )
 
-        # Step 3: Verify login by fetching live page (same session)
-        live_html = await _zenrows_fetch(live_url, method="GET", session_id=session_id)
+        # Step 3: Verify login by fetching live page WITH cookies
+        live_html, _ = await _zenrows_fetch(
+            live_url,
+            method="GET",
+            session_id=session_id,
+            extra_cookies=cf_cookies,
+        )
         text = live_html.lower()
 
         if "sign in" in text and "welcome back" in text and 'name="email"' in text:
@@ -820,6 +839,7 @@ async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[boo
         # Success: store session
         HTML_SCRAPE_SESSIONS[panel_id] = {
             "session_id": session_id,
+            "cookies": cf_cookies,  # ✅ Store cookies for later polling
             "login_url": login_url,
             "live_url": live_url,
             "last_login": time.time(),
@@ -890,16 +910,19 @@ def parse_html_scrape_rows(html_text: str, cfg: dict) -> list:
 
 
 async def fetch_html_scrape_items(panel_id: str, cfg: dict) -> Tuple[list, str]:
-    """Fetch live page HTML via ZenRows + parse. Returns (items, status)."""
     sess = HTML_SCRAPE_SESSIONS.get(panel_id)
     if not sess or "session_id" not in sess:
         return [], "❌ No active session"
 
     session_id = sess["session_id"]
+    cookies = sess.get("cookies", "")  # ✅ Get stored cookies
     live_url = sess["live_url"]
 
     try:
-        html_text = await _zenrows_fetch(live_url, method="GET", session_id=session_id)
+        html_text, _ = await _zenrows_fetch(
+            live_url, method="GET", session_id=session_id,
+            extra_cookies=cookies,  # ✅ Pass cookies
+        )
         lower = html_text.lower()
 
         if "sign in" in lower and "welcome back" in lower and 'name="email"' in html_text:
@@ -912,7 +935,6 @@ async def fetch_html_scrape_items(panel_id: str, cfg: dict) -> Tuple[list, str]:
 
     except Exception as e:
         return [], f"❌ ZenRows fetch error: {str(e)[:150]}"
-
 
 def _get_json_path(obj, path):
     if not path:
