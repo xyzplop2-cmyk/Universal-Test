@@ -1,4 +1,4 @@
-# Update V3 — HTML Scrape Panel + curl_cffi Cloudflare Bypass
+# Update V4 — HTML Scrape Panel + ZenRows Cloudflare Bypass
 import asyncio
 import logging
 import os
@@ -11,8 +11,6 @@ import time
 import datetime
 import threading
 import io
-import cloudscraper
-from bs4 import BeautifulSoup
 from collections import OrderedDict
 from functools import wraps
 from typing import Optional, List, Dict, Any, Tuple
@@ -23,14 +21,6 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from supabase.lib.client_options import ClientOptions as SupabaseClientOptions
-
-# ✅ NEW: curl_cffi for Cloudflare bypass
-try:
-    from curl_cffi.requests import AsyncSession as CFFISession
-    HAS_CURL_CFFI = True
-except ImportError:
-    CFFISession = None
-    HAS_CURL_CFFI = False
 
 try:
     import firebase_admin
@@ -66,6 +56,9 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 FIREBASE_B64 = os.environ.get("FIREBASE_BASE64")
 FIREBASE_JSON_ENV = os.environ.get("FIREBASE_CONFIG_JSON")
 
+# ✅ ZenRows API Key
+ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY", "")
+
 CURRENT_DB_MODE = "Cloud (Double)"
 
 OTP_ID_RETENTION_SECONDS = 30 * 24 * 60 * 60
@@ -91,8 +84,8 @@ API_FETCH_TIMEOUT = 8.0
 PANEL_INFO_CACHE_TTL = 60
 API_RECORDS_PER_POLL = 200
 
-# HTML scrape: curl_cffi impersonate browser version
-HTML_IMPERSONATE = "chrome124"
+# ✅ HTML scrape engine: ZenRows
+HTML_ENGINE = "ZenRows"
 
 SETTINGS_CACHE = {}
 SERVICES_CACHE = {}
@@ -380,6 +373,36 @@ def mask_api_key(key: str) -> str:
 
 async def run_db(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
+
+
+# ============================================================
+# ✅ ZENROWS CLOUDFLARE BYPASS — Helper
+# ============================================================
+async def _zenrows_fetch(target_url: str, method: str = "GET",
+                         data: dict = None, session_id: str = None) -> str:
+    """
+    Fetch a URL via ZenRows API (handles Cloudflare + JS rendering).
+    Raises RuntimeError on failure.
+    """
+    if not ZENROWS_API_KEY:
+        raise RuntimeError("ZENROWS_API_KEY is not set in environment variables")
+
+    params = {
+        "apikey": ZENROWS_API_KEY,
+        "url": target_url,
+        "js_render": "true",
+        "premium_proxy": "true",
+    }
+    if session_id:
+        params["session_id"] = session_id
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        if method.upper() == "POST":
+            r = await client.post("https://api.zenrows.com/v1/", params=params, data=data)
+        else:
+            r = await client.get("https://api.zenrows.com/v1/", params=params)
+        r.raise_for_status()
+        return r.text
 
 
 # ============================================================
@@ -719,9 +742,10 @@ async def fetch_captcha_panel_data(panel_id: str, cfg: dict) -> Tuple[list, str]
 
 
 # ============================================================
-# 🌐 HTML SCRAPE PANEL — Login + Fetch + Parse (curl_cffi)
+# 🌐 HTML SCRAPE PANEL — Login + Fetch + Parse (ZenRows)
 # ============================================================
 async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, str]:
+    """Login to HTML panel via ZenRows (handles Cloudflare + JS rendering)."""
     login_url = (cfg.get("login_url") or "").strip().rstrip("/")
     if not login_url.startswith("http"):
         login_url = "https://" + login_url
@@ -733,30 +757,21 @@ async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[boo
     if not login_url or not email or not password or not live_url:
         return False, "❌ Missing login URL / email / password / live URL"
 
-    # পুরোনো সেশন বন্ধ (যদি থাকে)
-    old = HTML_SCRAPE_SESSIONS.pop(panel_id, None)
-    if old and "scraper" in old:
-        try:
-            await old["scraper"].close()
-        except Exception:
-            pass
+    if not ZENROWS_API_KEY:
+        return False, "❌ ZENROWS_API_KEY not set in environment variables"
 
-    # cloudscraper ইনস্ট্যান্স তৈরি
-    scraper = cloudscraper.create_scraper(
-        browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
-    )
+    # Purge old session for this panel
+    HTML_SCRAPE_SESSIONS.pop(panel_id, None)
+
+    # Generate a stable session ID so ZenRows reuses cookies across requests
+    session_id = f"panel-{panel_id}-{int(time.time())}"
 
     try:
-        # লগইন পেজ লোড
-        res = await asyncio.to_thread(scraper.get, login_url, timeout=30)
-        preview = res.text[:500].replace("\n", " ")
-        logger.info(f"HTML panel {panel_id} login GET status={res.status_code} preview={preview}")
+        # Step 1: GET login page via ZenRows (bypasses Cloudflare)
+        html_text = await _zenrows_fetch(login_url, method="GET", session_id=session_id)
+        soup = BeautifulSoup(html_text, "html.parser")
 
-        if "checking your browser" in res.text.lower() or "just a moment" in res.text.lower():
-            await scraper.close()
-            return False, f"❌ Still blocked by Cloudflare. Preview: {preview[:200]}"
-
-        soup = BeautifulSoup(res.text, "html.parser")
+        # Find CSRF token
         csrf = None
         form = soup.find("form", {"id": "loginForm"}) or soup.find("form")
         if form:
@@ -769,34 +784,29 @@ async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[boo
                 csrf = meta.get("content")
 
         if not csrf:
-            await scraper.close()
-            return False, f"❌ CSRF token not found. Preview: {preview[:200]}"
+            preview = html_text[:300].replace("\n", " ")
+            return False, f"❌ CSRF token not found. Preview: {preview}"
 
+        # Step 2: POST login form via ZenRows (same session_id → same cookies)
         post_url = login_url + "/login"
         post_data = {"_token": csrf, "email": email, "password": password}
-        login_res = await asyncio.to_thread(scraper.post, post_url, data=post_data, timeout=30)
-        logger.info(f"HTML panel {panel_id} login POST status={login_res.status_code}")
+        await _zenrows_fetch(post_url, method="POST", data=post_data, session_id=session_id)
 
-        # লাইভ পেজ চেক
-        check_res = await asyncio.to_thread(scraper.get, live_url, timeout=30)
-        text = check_res.text.lower()
+        # Step 3: Verify login by fetching live page (same session)
+        live_html = await _zenrows_fetch(live_url, method="GET", session_id=session_id)
+        text = live_html.lower()
 
         if "sign in" in text and "welcome back" in text and 'name="email"' in text:
-            await scraper.close()
             return False, "❌ Login failed — invalid credentials"
-        if "checking your browser" in text or "just a moment" in text:
-            await scraper.close()
-            return False, "❌ Cloudflare challenge on live page after login"
 
         ok_keywords = ["logout", "live sms", "client active sms", "message stream"]
         if not any(kw in text for kw in ok_keywords):
-            live_preview = check_res.text[:500].replace("\n", " ")
-            await scraper.close()
-            return False, f"❌ Login verify failed. Live preview: {live_preview}"
+            preview = live_html[:300].replace("\n", " ")
+            return False, f"❌ Login verify failed. Live preview: {preview}"
 
-        # সেশন সংরক্ষণ (এখানে 'scraper' কী ব্যবহার করা হচ্ছে)
+        # Success: store session
         HTML_SCRAPE_SESSIONS[panel_id] = {
-            "scraper": scraper,
+            "session_id": session_id,
             "login_url": login_url,
             "live_url": live_url,
             "last_login": time.time(),
@@ -804,11 +814,8 @@ async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[boo
         return True, "✅ Logged in & Active"
 
     except Exception as e:
-        try:
-            await scraper.close()
-        except Exception:
-            pass
-        return False, f"❌ Error: {str(e)[:150]}"
+        return False, f"❌ ZenRows error: {str(e)[:150]}"
+
 
 def parse_html_scrape_rows(html_text: str, cfg: dict) -> list:
     """Parse HTML live-sms page → list of items. Works with Augestel-style markup."""
@@ -870,32 +877,28 @@ def parse_html_scrape_rows(html_text: str, cfg: dict) -> list:
 
 
 async def fetch_html_scrape_items(panel_id: str, cfg: dict) -> Tuple[list, str]:
+    """Fetch live page HTML via ZenRows + parse. Returns (items, status)."""
     sess = HTML_SCRAPE_SESSIONS.get(panel_id)
-    if not sess or "scraper" not in sess:
+    if not sess or "session_id" not in sess:
         return [], "❌ No active session"
 
-    scraper = sess["scraper"]
+    session_id = sess["session_id"]
     live_url = sess["live_url"]
 
     try:
-        res = await asyncio.to_thread(scraper.get, live_url, timeout=30)
-        if res.status_code in (301, 302, 303, 307, 308):
-            return [], "❌ Session expired (redirect)"
-        if res.status_code in (401, 403):
-            return [], f"❌ Access denied ({res.status_code})"
+        html_text = await _zenrows_fetch(live_url, method="GET", session_id=session_id)
+        lower = html_text.lower()
 
-        text = res.text
-        lower = text.lower()
-        if "sign in" in lower and "welcome back" in lower and 'name="email"' in text:
+        if "sign in" in lower and "welcome back" in lower and 'name="email"' in html_text:
             return [], "❌ Session expired"
         if "checking your browser" in lower or "just a moment" in lower:
-            return [], "❌ Cloudflare challenge on live page"
+            return [], "❌ Cloudflare challenge (ZenRows could not bypass)"
 
-        items = parse_html_scrape_rows(text, cfg)
+        items = parse_html_scrape_rows(html_text, cfg)
         return items, f"✅ {len(items)} item(s) found"
 
     except Exception as e:
-        return [], f"❌ Fetch error: {str(e)[:150]}"
+        return [], f"❌ ZenRows fetch error: {str(e)[:150]}"
 
 
 def _get_json_path(obj, path):
@@ -1497,14 +1500,7 @@ def delete_api_panel_sync(panel_id: str):
             pass
     CAPTCHA_PANEL_STATUS.pop(str(panel_id), None)
 
-    old2 = HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)
-    if old2:
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.run_coroutine_threadsafe(old2["scraper"].close(), loop)
-        except Exception:
-            pass
+    HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)  # ZenRows session needs no explicit close
     HTML_SCRAPE_STATUS.pop(str(panel_id), None)
 
 
@@ -2611,7 +2607,7 @@ def build_panel_manage_view(panel_id: str):
         except Exception:
             cfg = {}
         status = HTML_SCRAPE_STATUS.get(str(panel_id), "⏳ Pending login")
-        engine = f"curl_cffi ({HTML_IMPERSONATE})" if HAS_CURL_CFFI else "❌ curl_cffi NOT installed"
+        engine = f"{HTML_ENGINE} (Cloudflare bypass)" if ZENROWS_API_KEY else "❌ ZENROWS_API_KEY NOT set"
         text = (
             f"🌐 **HTML SCRAPE PANEL: {escape_md(p['name'])}**\n\n"
             f"🌐 **Login URL:** `{escape_md(cfg.get('login_url', 'N/A'))}`\n"
@@ -3003,8 +2999,8 @@ def health():
         "chat_locks": len(_CHAT_LOCKS),
         "force_join_enabled": is_force_join_enabled(),
         "refer_enabled": get_setting("refer_enabled", "true") == "true",
-        "curl_cffi": "enabled" if HAS_CURL_CFFI else "disabled",
-        "html_impersonate": HTML_IMPERSONATE,
+        "html_engine": HTML_ENGINE,
+        "zenrows_api_key_set": bool(ZENROWS_API_KEY),
     })
 
 
@@ -3897,12 +3893,12 @@ async def admin_add_captcha_panel_start(update: Update, context: ContextTypes.DE
 @admin_only
 async def admin_add_html_scrape_panel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['panel_flow'] = 'html_scrape'
-    cf_status = "🟢 curl_cffi ready (Cloudflare bypass)" if HAS_CURL_CFFI else "🔴 curl_cffi NOT installed — run: pip install curl-cffi"
+    zen_status = "🟢 ZenRows API key set" if ZENROWS_API_KEY else "🔴 ZENROWS_API_KEY NOT set"
     await update.callback_query.message.reply_text(
         "🌐 **HTML SCRAPE PANEL SETUP**\n\n"
-        "This panel logs in via HTTP form (using curl_cffi Chrome impersonation → bypasses Cloudflare),\n"
-        "then scrapes the live SMS page every ~10 seconds.\n\n"
-        f"🚀 **Engine Status:** {cf_status}\n\n"
+        "This panel logs in via HTTP form and scrapes the live SMS page.\n"
+        "Cloudflare bypass is handled by **ZenRows** (hosted API).\n\n"
+        f"🚀 **Engine Status:** {zen_status}\n\n"
         "**Step 1/5:** Enter a panel name (e.g., `Augestel`):",
         parse_mode="Markdown"
     )
@@ -3988,7 +3984,7 @@ async def receive_hs_live_url(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if p_name and cfg["login_url"]:
         pid = await run_db(save_api_panel_sync, p_name, cfg["login_url"], "", p_interval, json.dumps(cfg))
-        engine = f"curl_cffi ({HTML_IMPERSONATE})" if HAS_CURL_CFFI else "❌ curl_cffi not installed"
+        engine = f"{HTML_ENGINE}" if ZENROWS_API_KEY else "❌ ZENROWS_API_KEY not set"
         await update.message.reply_text(
             f"✅ **HTML Scrape Panel Added!**\n\n"
             f"📌 Name: `{escape_md(p_name)}`\n"
@@ -5086,20 +5082,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("adm:api:test_html:"):
         if not user_is_admin: await query.answer(); return
-        await query.answer("Testing scrape via curl_cffi...")
+        await query.answer("Testing scrape via ZenRows...")
         panel_id = data.split(":", 3)[3]
         p = await run_db(get_api_panel_sync, panel_id)
         if not p:
             await query.edit_message_text("⚠️ Panel not found.")
             return
 
-        if not HAS_CURL_CFFI:
+        if not ZENROWS_API_KEY:
             await query.edit_message_text(
-                "❌ <b>curl_cffi not installed!</b>\n\n"
-                "Cloudflare bypass requires curl_cffi.\n"
-                "Run this on your server:\n"
-                "<code>pip install curl-cffi</code>\n"
-                "Then restart the bot.",
+                "❌ <b>ZENROWS_API_KEY not set!</b>\n\n"
+                "Add it to Render Environment Variables and restart the bot.",
                 parse_mode="HTML"
             )
             return
@@ -5109,10 +5102,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             cfg = {}
 
-        old = HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)
-        if old:
-            try: await old["scraper"].close()
-            except Exception: pass
+        HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)
 
         ok, status = await attempt_html_login(str(panel_id), p, cfg)
         if not ok:
@@ -5125,7 +5115,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"<b>Status:</b>\n<pre>{html.escape(status[:1500])}</pre>\n\n"
                 f"<b>Login URL:</b> <code>{html.escape(cfg.get('login_url',''))}</code>\n"
                 f"<b>Live URL:</b> <code>{html.escape(cfg.get('live_url',''))}</code>\n"
-                f"<b>Engine:</b> curl_cffi ({HTML_IMPERSONATE})",
+                f"<b>Engine:</b> {HTML_ENGINE}",
                 reply_markup=kbd, parse_mode="HTML"
             )
             return
@@ -5158,7 +5148,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ <b>Scrape OK</b>\n"
             f"Status: <code>{html.escape(fetch_status)}</code>\n"
             f"Total: <b>{len(items)}</b> items\n"
-            f"Engine: curl_cffi ({HTML_IMPERSONATE})\n"
+            f"Engine: {HTML_ENGINE}\n"
             f"{preview}",
             reply_markup=kbd, parse_mode="HTML"
         )
@@ -5286,10 +5276,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: await old["client"].aclose()
             except Exception: pass
         CAPTCHA_PANEL_STATUS[str(panel_id)] = "🔄 Re-login triggered"
-        old2 = HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)
-        if old2:
-            try: await old2["scraper"].close()
-            except Exception: pass
+        HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)  # ZenRows session needs no explicit close
         HTML_SCRAPE_STATUS[str(panel_id)] = "🔄 Re-login triggered"
         await query.answer("Session cleared. Will re-login shortly.", show_alert=True)
         text, kbd = await run_db(build_panel_manage_view, str(panel_id))
@@ -5669,12 +5656,7 @@ async def poll_single_panel(panel_id: str, application: Application,
                         or "error" in status_lower
                         or "redirect" in status_lower
                         or "denied" in status_lower):
-                    old = HTML_SCRAPE_SESSIONS.pop(panel_id, None)
-                    if old:
-                        try:
-                            await old["scraper"].close()
-                        except Exception:
-                            pass
+                    HTML_SCRAPE_SESSIONS.pop(panel_id, None)
                     logger.info(f"HTML panel {panel_id}: {status} — forcing re-login")
                     await asyncio.sleep(5)
                     continue
@@ -5910,10 +5892,10 @@ def main():
 
     load_known_users()
 
-    if HAS_CURL_CFFI:
-        logger.info(f"curl_cffi loaded — HTML scrape will use {HTML_IMPERSONATE} TLS impersonation")
+    if ZENROWS_API_KEY:
+        logger.info(f"ZenRows API key loaded — HTML scrape will use {HTML_ENGINE} for Cloudflare bypass")
     else:
-        logger.warning("curl_cffi NOT installed — HTML scrape Cloudflare bypass disabled. Run: pip install curl-cffi")
+        logger.warning("ZENROWS_API_KEY NOT set — HTML scrape Cloudflare bypass disabled. Add it to environment variables.")
 
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info(f"Flask started on port {os.environ.get('PORT', 8080)}")
@@ -6059,12 +6041,7 @@ def main():
                 pass
         CAPTCHA_SESSIONS.clear()
 
-        for pid, sess in list(HTML_SCRAPE_SESSIONS.items()):
-            try:
-                await sess["scraper"].close()
-            except Exception:
-                pass
-        HTML_SCRAPE_SESSIONS.clear()
+        HTML_SCRAPE_SESSIONS.clear()  # ZenRows sessions need no explicit close
 
         try:
             await asyncio.to_thread(push_dirty_to_firebase_sync)
