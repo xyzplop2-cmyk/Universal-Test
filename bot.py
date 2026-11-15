@@ -1,4 +1,4 @@
-# Update V4 — HTML Scrape Panel + ZenRows Cloudflare Bypass
+# Update V2
 import asyncio
 import logging
 import os
@@ -6,6 +6,7 @@ import re
 import json
 import base64
 import hashlib
+import hmac
 import html
 import time
 import datetime
@@ -29,7 +30,7 @@ try:
 except ImportError:
     HAS_FIREBASE_LIB = False
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.error import RetryAfter
 from telegram.ext import (
@@ -56,9 +57,6 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 FIREBASE_B64 = os.environ.get("FIREBASE_BASE64")
 FIREBASE_JSON_ENV = os.environ.get("FIREBASE_CONFIG_JSON")
 
-# ✅ ZenRows API Key
-ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY", "")
-
 CURRENT_DB_MODE = "Cloud (Double)"
 
 OTP_ID_RETENTION_SECONDS = 30 * 24 * 60 * 60
@@ -84,9 +82,6 @@ API_FETCH_TIMEOUT = 8.0
 PANEL_INFO_CACHE_TTL = 60
 API_RECORDS_PER_POLL = 200
 
-# ✅ HTML scrape engine: ZenRows
-HTML_ENGINE = "ZenRows"
-
 SETTINGS_CACHE = {}
 SERVICES_CACHE = {}
 PAYOUTS_CACHE = {}
@@ -105,14 +100,15 @@ _PANEL_INFO_CACHE: Dict[str, Dict[str, Any]] = {}
 CAPTCHA_SESSIONS: Dict[str, dict] = {}
 CAPTCHA_PANEL_STATUS: Dict[str, str] = {}
 
-# 🌐 HTML SCRAPE PANEL
-HTML_SCRAPE_SESSIONS: Dict[str, dict] = {}
-HTML_SCRAPE_STATUS: Dict[str, str] = {}
-HTML_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
+AUGESTEL_PANEL_STATUS: Dict[str, str] = {}
+AUGESTEL_PANEL_COUNTS: Dict[str, int] = {}
+_AUGESTEL_PANELS_CACHE: Dict[str, Any] = {"panels": [], "ts": 0.0, "loaded": False}
+_MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_BOT_APP: Optional[Application] = None
+_POLLER_READY_EVENT: Optional[asyncio.Event] = None
+_SHARED_PROCESSED_IDS: Optional[Any] = None
+_DETECTED_BASE_URL: str = ""
+_DETECTED_PUBLIC_IP: str = ""
 
 # 🔒 FORCE JOIN CACHE
 _FORCE_JOIN_CACHE: Dict[int, float] = {}
@@ -376,74 +372,108 @@ async def run_db(func, *args, **kwargs):
 
 
 # ============================================================
-# ✅ ZENROWS CLOUDFLARE BYPASS — Helper
-# ============================================================
-async def _zenrows_fetch(target_url: str, method: str = "GET",
-                         data: dict = None, session_id: str = None,
-                         extra_cookies: str = None) -> Tuple[str, str]:
-    """
-    Fetch via ZenRows. Returns (text, cookies_header).
-    ✅ js_render only on GET.
-    ✅ API key in header.
-    ✅ Captures Zr-Cookies header for session continuity.
-    ✅ Timeout raised to 180s.
-    """
-    if not ZENROWS_API_KEY:
-        raise RuntimeError("ZENROWS_API_KEY is not set in environment variables")
-
-    headers = {"X-API-Key": ZENROWS_API_KEY}
-    params = {
-        "url": target_url,
-        "premium_proxy": "true",
-    }
-
-    if method.upper() == "GET":
-        params["js_render"] = "true"
-
-    if session_id:
-        params["session_id"] = session_id
-
-    # Forward cookies from previous response (if any)
-    if extra_cookies:
-        headers["Cookie"] = extra_cookies
-
-    async with httpx.AsyncClient(timeout=180) as client:  # ✅ 180s timeout
-        if method.upper() == "POST":
-            r = await client.post(
-                "https://api.zenrows.com/v1/",
-                params=params,
-                headers=headers,
-                data=data,
-            )
-        else:
-            r = await client.get(
-                "https://api.zenrows.com/v1/",
-                params=params,
-                headers=headers,
-            )
-        r.raise_for_status()
-
-        # ✅ Capture ZenRows cookies for session persistence
-        cookies_header = r.headers.get("Zr-Cookies", "")
-        return r.text, cookies_header
-
-# ============================================================
 # 🔐 AUTO CAPTCHA PANEL — Helpers & Session Store
 # ============================================================
 def get_panel_type(panel: dict) -> str:
+    if str(panel.get("url") or "").startswith("webhook://augestel"):
+        return "augestel"
     mj = panel.get("mapping_json") or ""
     if not mj:
         return "api"
     try:
         m = json.loads(mj)
+        if isinstance(m, dict) and m.get("_panel_type") == "augestel":
+            return "augestel"
+        if isinstance(m, dict) and m.get("_panel_type") == "captcha":
+            return "captcha"
         if isinstance(m, dict):
-            t = m.get("_panel_type")
-            if t in ("captcha", "html_scrape"):
-                return t
             return "custom"
     except Exception:
         pass
     return "api"
+
+
+def _get_augestel_secret(panel: dict) -> str:
+    mj = panel.get("mapping_json") or ""
+    if mj:
+        try:
+            m = json.loads(mj)
+            if isinstance(m, dict) and m.get("webhook_secret"):
+                return str(m["webhook_secret"]).strip()
+        except Exception:
+            pass
+    return str(panel.get("token") or "").strip()
+
+
+def _verify_augestel_signature(raw_body: bytes, secret: str, sig_header: str) -> bool:
+    if not secret or not sig_header:
+        return False
+    digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    expected = f"sha256={digest}"
+    return hmac.compare_digest(expected, sig_header.strip())
+
+
+def _get_webhook_base_url() -> str:
+    saved_base = (get_setting("webhook_base_url", "") or "").strip().rstrip("/")
+    if saved_base:
+        if not saved_base.startswith(("http://", "https://")):
+            saved_base = f"https://{saved_base}"
+        return saved_base
+    for env_key in (
+        "WEBHOOK_BASE_URL", "PUBLIC_URL", "BASE_URL",
+        "RENDER_EXTERNAL_URL", "APP_URL", "SERVER_URL", "RAILWAY_STATIC_URL",
+    ):
+        val = (os.environ.get(env_key) or "").strip().rstrip("/")
+        if val:
+            if not val.startswith(("http://", "https://")):
+                val = f"https://{val}"
+            return val
+    for domain_key in (
+        "RENDER_EXTERNAL_HOSTNAME", "RAILWAY_PUBLIC_DOMAIN",
+        "KOYEB_PUBLIC_DOMAIN", "SPACE_HOST", "REPLIT_DEV_DOMAIN",
+    ):
+        val = (os.environ.get(domain_key) or "").strip().rstrip("/")
+        if val:
+            return f"https://{val}"
+    fly_app = (os.environ.get("FLY_APP_NAME") or "").strip()
+    if fly_app:
+        return f"https://{fly_app}.fly.dev"
+    heroku_app = (os.environ.get("HEROKU_APP_NAME") or "").strip()
+    if heroku_app:
+        return f"https://{heroku_app}.herokuapp.com"
+    if _DETECTED_BASE_URL:
+        return _DETECTED_BASE_URL.rstrip("/")
+    if _DETECTED_PUBLIC_IP:
+        port = str(os.environ.get("PORT", "8080")).strip()
+        if port in ("80", ""):
+            return f"http://{_DETECTED_PUBLIC_IP}"
+        if port == "443":
+            return f"https://{_DETECTED_PUBLIC_IP}"
+        return f"http://{_DETECTED_PUBLIC_IP}:{port}"
+    return ""
+
+
+def _get_augestel_endpoint_url(panel_id: Optional[str] = None) -> str:
+    path = f"/webhook/augestel/{panel_id}" if panel_id else "/webhook/augestel"
+    base = _get_webhook_base_url()
+    if base:
+        return f"{base}{path}".replace("`", "")
+    return f"https://your-domain.com{path}"
+
+
+async def _detect_public_ip_once() -> None:
+    global _DETECTED_PUBLIC_IP
+    if _get_webhook_base_url():
+        return
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get("https://api.ipify.org")
+            if r.status_code == 200:
+                ip = r.text.strip()
+                if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", ip):
+                    _DETECTED_PUBLIC_IP = ip
+    except Exception:
+        pass
 
 
 def _solve_captcha_from_html(html_text: str, soup: BeautifulSoup) -> str:
@@ -762,179 +792,6 @@ async def fetch_captcha_panel_data(panel_id: str, cfg: dict) -> Tuple[list, str]
     except Exception as e:
         return [], f"❌ Fetch error: {str(e)[:80]}"
 
-
-# ============================================================
-# 🌐 HTML SCRAPE PANEL — Login + Fetch + Parse (ZenRows)
-# ============================================================
-async def attempt_html_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, str]:
-    login_url = (cfg.get("login_url") or "").strip().rstrip("/")
-    if not login_url.startswith("http"):
-        login_url = "https://" + login_url
-
-    email = cfg.get("username", "")
-    password = cfg.get("password", "")
-    live_url = (cfg.get("live_url") or "").strip()
-
-    if not login_url or not email or not password or not live_url:
-        return False, "❌ Missing login URL / email / password / live URL"
-
-    if not ZENROWS_API_KEY:
-        return False, "❌ ZENROWS_API_KEY not set in environment variables"
-
-    HTML_SCRAPE_SESSIONS.pop(panel_id, None)
-
-    session_id = f"panel-{panel_id}-{int(time.time())}"
-
-    try:
-        # Step 1: GET login page and capture cookies
-        html_text, cf_cookies = await _zenrows_fetch(
-            login_url, method="GET", session_id=session_id
-        )
-        soup = BeautifulSoup(html_text, "html.parser")
-
-        # Find CSRF token
-        csrf = None
-        form = soup.find("form", {"id": "loginForm"}) or soup.find("form")
-        if form:
-            tok = form.find("input", {"name": "_token"})
-            if tok:
-                csrf = tok.get("value")
-        if not csrf:
-            meta = soup.find("meta", {"name": "csrf-token"})
-            if meta:
-                csrf = meta.get("content")
-
-        if not csrf:
-            preview = html_text[:300].replace("\n", " ")
-            return False, f"❌ CSRF token not found. Preview: {preview}"
-
-        # Step 2: POST login form WITH the cookies from Step 1
-        post_url = login_url + "/login"
-        post_data = {"_token": csrf, "email": email, "password": password}
-        await _zenrows_fetch(
-            post_url,
-            method="POST",
-            data=post_data,
-            session_id=session_id,
-            extra_cookies=cf_cookies,  # ✅ Forward cookies
-        )
-
-        # Step 3: Verify login by fetching live page WITH cookies
-        live_html, _ = await _zenrows_fetch(
-            live_url,
-            method="GET",
-            session_id=session_id,
-            extra_cookies=cf_cookies,
-        )
-        text = live_html.lower()
-
-        if "sign in" in text and "welcome back" in text and 'name="email"' in text:
-            return False, "❌ Login failed — invalid credentials"
-
-        ok_keywords = ["logout", "live sms", "client active sms", "message stream"]
-        if not any(kw in text for kw in ok_keywords):
-            preview = live_html[:300].replace("\n", " ")
-            return False, f"❌ Login verify failed. Live preview: {preview}"
-
-        # Success: store session
-        HTML_SCRAPE_SESSIONS[panel_id] = {
-            "session_id": session_id,
-            "cookies": cf_cookies,  # ✅ Store cookies for later polling
-            "login_url": login_url,
-            "live_url": live_url,
-            "last_login": time.time(),
-        }
-        return True, "✅ Logged in & Active"
-
-    except Exception as e:
-        return False, f"❌ ZenRows error: {str(e)[:150]}"
-
-
-def parse_html_scrape_rows(html_text: str, cfg: dict) -> list:
-    """Parse HTML live-sms page → list of items. Works with Augestel-style markup."""
-    soup = BeautifulSoup(html_text, "html.parser")
-    items = []
-    seen_ids = set()
-
-    for tr in soup.find_all("tr", attrs={"data-id": True}):
-        data_id = tr.get("data-id", "")
-        if not data_id.startswith("MSG-"):
-            continue
-        if data_id in seen_ids:
-            continue
-        seen_ids.add(data_id)
-
-        num_el = tr.find(attrs={"data-copy-number": True})
-        if not num_el:
-            continue
-        number = (num_el.get("data-copy-number") or "").strip()
-        if not number:
-            continue
-
-        try:
-            epoch_ms = int(data_id.rsplit("-", 1)[-1])
-            dt_iso = datetime.datetime.utcfromtimestamp(epoch_ms / 1000).isoformat() + "Z"
-        except Exception:
-            dt_iso = data_id
-
-        message = ""
-        msg_td = tr.find("td", class_="max-w-xs")
-        if msg_td:
-            span = msg_td.find("span")
-            if span:
-                message = span.get_text(separator=" ", strip=True)
-        if not message:
-            tds_scan = tr.find_all("td")
-            if len(tds_scan) >= 3:
-                message = tds_scan[2].get_text(separator=" ", strip=True)
-        if not message:
-            continue
-
-        sid = ""
-        tds = tr.find_all("td")
-        if len(tds) >= 2:
-            sid_span = tds[1].find("span")
-            if sid_span:
-                sid = sid_span.get_text(strip=True)
-
-        items.append({
-            "num": number,
-            "message": message,
-            "dt": dt_iso,
-            "payout": 1,
-            "cli": sid,
-            "_raw_id": data_id,
-        })
-
-    return items
-
-
-async def fetch_html_scrape_items(panel_id: str, cfg: dict) -> Tuple[list, str]:
-    sess = HTML_SCRAPE_SESSIONS.get(panel_id)
-    if not sess or "session_id" not in sess:
-        return [], "❌ No active session"
-
-    session_id = sess["session_id"]
-    cookies = sess.get("cookies", "")  # ✅ Get stored cookies
-    live_url = sess["live_url"]
-
-    try:
-        html_text, _ = await _zenrows_fetch(
-            live_url, method="GET", session_id=session_id,
-            extra_cookies=cookies,  # ✅ Pass cookies
-        )
-        lower = html_text.lower()
-
-        if "sign in" in lower and "welcome back" in lower and 'name="email"' in html_text:
-            return [], "❌ Session expired"
-        if "checking your browser" in lower or "just a moment" in lower:
-            return [], "❌ Cloudflare challenge (ZenRows could not bypass)"
-
-        items = parse_html_scrape_rows(html_text, cfg)
-        return items, f"✅ {len(items)} item(s) found"
-
-    except Exception as e:
-        return [], f"❌ ZenRows fetch error: {str(e)[:150]}"
 
 def _get_json_path(obj, path):
     if not path:
@@ -1510,6 +1367,8 @@ def save_api_panel_sync(name: str, url: str, token: str,
             except Exception:
                 pass
         _PANEL_INFO_CACHE.pop(str(pid), None)
+        _AUGESTEL_PANELS_CACHE["loaded"] = False
+        _AUGESTEL_PANELS_CACHE["ts"] = 0.0
         return pid
     except Exception as e:
         logger.error(f"Supabase save API panel error: {e}")
@@ -1520,6 +1379,8 @@ def delete_api_panel_sync(panel_id: str):
     try:
         supabase.table("api_panels").delete().eq("id", int(panel_id)).execute()
         _PANEL_INFO_CACHE.pop(str(panel_id), None)
+        _AUGESTEL_PANELS_CACHE["loaded"] = False
+        _AUGESTEL_PANELS_CACHE["ts"] = 0.0
         if firebase_db_ref:
             firebase_db_ref.reference(f"api_panels/{panel_id}").delete()
     except Exception as e:
@@ -1534,9 +1395,8 @@ def delete_api_panel_sync(panel_id: str):
         except Exception:
             pass
     CAPTCHA_PANEL_STATUS.pop(str(panel_id), None)
-
-    HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)  # ZenRows session needs no explicit close
-    HTML_SCRAPE_STATUS.pop(str(panel_id), None)
+    AUGESTEL_PANEL_STATUS.pop(str(panel_id), None)
+    AUGESTEL_PANEL_COUNTS.pop(str(panel_id), None)
 
 
 def get_setting(key: str, default_val: str = "") -> str:
@@ -1560,6 +1420,7 @@ def set_setting(key: str, value: str):
 # 🆕 COUNTRY SHORT-NAME HELPERS
 # ============================================================
 def get_country_short_sync(service: str, country: str) -> str:
+    """Return short-form for a service/country pair. Falls back to country name."""
     if not service or not country:
         return country or ""
     val = get_setting(f"country_short:{service}:{country}", "")
@@ -1963,6 +1824,7 @@ def check_and_process_weekly_reset_sync() -> list:
 
 
 def get_ranking_leaderboard_sync(user_id: int) -> str:
+    """Build leaderboard. User name is clickable ONLY if viewer is admin."""
     now = time.time()
     top_5 = None
     if LEADERBOARD_CACHE["data"] is not None and now - LEADERBOARD_CACHE["ts"] < LEADERBOARD_CACHE_TTL:
@@ -1991,6 +1853,7 @@ def get_ranking_leaderboard_sync(user_id: int) -> str:
     except Exception as e:
         logger.error(f"Supabase user rank error: {e}")
 
+    # 🆕 Only admins can click on user names to open their profile
     viewer_is_admin = is_admin_sync(user_id)
 
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
@@ -2531,6 +2394,7 @@ def build_service_manage_view(service: str):
         for cnt, count in cnts.items():
             payout = get_payout_sync(service, cnt)
             short = get_country_short_sync(service, cnt)
+            # 🆕 Show short name next to full name
             text += f"• **{escape_md(cnt)}** (`{escape_md(short)}`): `{count}` avail | `{fmt_num(payout)} ৳`\n"
     else:
         text += "No countries configured.\n"
@@ -2603,7 +2467,7 @@ def build_api_panels_view():
             [create_button("➕ Connect Standard Panel", callback_data="adm:api:add", style="success")],
             [create_button("🔧 Connect Custom API", callback_data="adm:api:add_custom", style="primary")],
             [create_button("🔐 Connect Captcha Panel", callback_data="adm:api:add_captcha", style="danger")],
-            [create_button("🌐 Connect HTML Scrape Panel", callback_data="adm:api:add_html", style="success")],
+            [create_button("Augestel panel", callback_data="adm:api:add_augestel", style="primary")],
         ]
         return text, InlineKeyboardMarkup(buttons)
 
@@ -2614,20 +2478,26 @@ def build_api_panels_view():
         pname = p["name"]
         pinterval = p.get("polling_interval", 5.0)
         p_type = get_panel_type(p)
-        tag = " 🔐" if p_type == "captcha" else (" 🔧" if p_type == "custom" else (" 🌐" if p_type == "html_scrape" else ""))
-        text += f"\n🔹 **{escape_md(pname)}**{tag} (Polling: `{pinterval}s`)"
-        if p_type == "captcha":
-            st = CAPTCHA_PANEL_STATUS.get(str(pid), "⏳ Pending login")
-            text += f"\n   └ `{escape_md(st)}`"
-        elif p_type == "html_scrape":
-            st = HTML_SCRAPE_STATUS.get(str(pid), "⏳ Pending login")
-            text += f"\n   └ `{escape_md(st)}`"
+        if p_type == "augestel":
+            st = AUGESTEL_PANEL_STATUS.get(str(pid), "🟢 Webhook Ready")
+            ep = _get_augestel_endpoint_url(str(pid))
+            text += (
+                f"\n🔹 **{escape_md(pname)}** 🪝 (Mode: `Webhook`)"
+                f"\n   ├ Endpoint: `{ep}`"
+                f"\n   └ `{escape_md(st)}`"
+            )
+        else:
+            tag = " 🔐" if p_type == "captcha" else (" 🔧" if p_type == "custom" else "")
+            text += f"\n🔹 **{escape_md(pname)}**{tag} (Polling: `{pinterval}s`)"
+            if p_type == "captcha":
+                st = CAPTCHA_PANEL_STATUS.get(str(pid), "⏳ Pending login")
+                text += f"\n   └ `{escape_md(st)}`"
         buttons.append([create_button(f"⚙️ {pname}", callback_data=f"adm:api:view:{pid}", style="primary")])
 
     buttons.append([create_button("➕ Connect Standard Panel", callback_data="adm:api:add", style="success")])
     buttons.append([create_button("🔧 Connect Custom API", callback_data="adm:api:add_custom", style="primary")])
     buttons.append([create_button("🔐 Connect Captcha Panel", callback_data="adm:api:add_captcha", style="danger")])
-    buttons.append([create_button("🌐 Connect HTML Scrape Panel", callback_data="adm:api:add_html", style="success")])
+    buttons.append([create_button("Augestel panel", callback_data="adm:api:add_augestel", style="primary")])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -2636,26 +2506,29 @@ def build_panel_manage_view(panel_id: str):
     if not p:
         return "⚠️ Panel not found.", InlineKeyboardMarkup([[create_button("Back to Panels", callback_data="adm:api:list", style="danger")]])
 
-    if get_panel_type(p) == "html_scrape":
-        try:
-            cfg = json.loads(p.get("mapping_json") or "{}")
-        except Exception:
-            cfg = {}
-        status = HTML_SCRAPE_STATUS.get(str(panel_id), "⏳ Pending login")
-        engine = f"{HTML_ENGINE} (Cloudflare bypass)" if ZENROWS_API_KEY else "❌ ZENROWS_API_KEY NOT set"
+    if get_panel_type(p) == "augestel":
+        secret = _get_augestel_secret(p)
+        masked_secret = mask_api_key(secret).replace("`", "")
+        exact_endpoint = _get_augestel_endpoint_url(str(panel_id))
+        exact_path = f"/webhook/augestel/{panel_id}"
+        status = AUGESTEL_PANEL_STATUS.get(str(panel_id), "🟢 Listening for webhooks").replace("`", "")
+        rx_count = AUGESTEL_PANEL_COUNTS.get(str(panel_id), 0)
         text = (
-            f"🌐 **HTML SCRAPE PANEL: {escape_md(p['name'])}**\n\n"
-            f"🌐 **Login URL:** `{escape_md(cfg.get('login_url', 'N/A'))}`\n"
-            f"👤 **Email:** `{escape_md(cfg.get('username', 'N/A'))}`\n"
-            f"🔑 **Password:** `******`\n"
-            f"📄 **Live URL:** `{escape_md(cfg.get('live_url', 'N/A'))}`\n"
-            f"⏱️ **Polling:** `{p.get('polling_interval', 10)}s`\n"
-            f"🚀 **Engine:** `{engine}`\n"
-            f"📊 **Status:** `{escape_md(status)}`\n"
+            f"🪝 **AUGESTEL PANEL: {escape_md(p['name'])}**\n\n"
+            f"📌 **Panel Name:** {escape_md(p['name'])}\n"
+            f"🧩 **Type:** Webhook (No Polling)\n"
+            f"🎯 **Augestel Dashboard Endpoint:**\n`{exact_endpoint}`\n"
+            f"🛣️ **Method & Route:** `POST {exact_path}`\n"
+            f"📡 **Dashboard Event:** `message.received`\n"
+            f"🔐 **Signature Header:** `X-Augestel-Signature`\n"
+            f"🔑 **Signing Secret:** `{masked_secret}`\n"
+            f"📨 **Received Count:** `{rx_count}`\n"
+            f"📊 **Status:** `{status}`\n"
         )
         buttons = [
-            [create_button("🧪 Test Scrape (Debug)", callback_data=f"adm:api:test_html:{panel_id}", style="primary")],
-            [create_button("🔄 Force Re-Login", callback_data=f"adm:api:relogin:{panel_id}", style="success")],
+            [create_button("📋 Copy Dashboard Endpoint", copy_text=exact_endpoint, style="success")],
+            [create_button("🌐 Set Domain / Base URL", callback_data=f"adm:api:aug_domain:{panel_id}", style="primary")],
+            [create_button("🧪 Test Webhook", callback_data=f"adm:api:test:{panel_id}", style="primary")],
             [create_button("🗑️ Delete Panel", callback_data=f"adm:api:delconf:{panel_id}", style="danger")],
             [create_button("Back to Panels", callback_data="adm:api:list", style="primary")]
         ]
@@ -3012,6 +2885,146 @@ def get_services_keyboard():
 flask_app = Flask(__name__)
 
 
+@flask_app.before_request
+def _capture_public_base_url():
+    global _DETECTED_BASE_URL
+    if _DETECTED_BASE_URL:
+        return
+    host = (request.headers.get("X-Forwarded-Host") or request.host or "").split(",")[0].strip()
+    if host and not host.startswith(("127.0.0.1", "localhost", "0.0.0.0")):
+        proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "https").split(",")[0].strip()
+        _DETECTED_BASE_URL = f"{proto}://{host}"
+
+
+def _get_augestel_panels_cached(force_refresh: bool = False) -> list:
+    now = time.time()
+    if (
+        not force_refresh
+        and _AUGESTEL_PANELS_CACHE["loaded"]
+        and (now - _AUGESTEL_PANELS_CACHE["ts"]) < PANEL_INFO_CACHE_TTL
+    ):
+        return _AUGESTEL_PANELS_CACHE["panels"]
+    all_panels = get_all_api_panels_sync()
+    aug_panels = [p for p in all_panels if get_panel_type(p) == "augestel"]
+    _AUGESTEL_PANELS_CACHE["panels"] = aug_panels
+    _AUGESTEL_PANELS_CACHE["ts"] = now
+    _AUGESTEL_PANELS_CACHE["loaded"] = True
+    return aug_panels
+
+
+async def _process_augestel_webhook_item(panel_id: str, item: dict):
+    try:
+        if _POLLER_READY_EVENT is not None:
+            await asyncio.wait_for(_POLLER_READY_EVENT.wait(), timeout=15.0)
+    except Exception:
+        pass
+    if _SHARED_PROCESSED_IDS is None or _BOT_APP is None:
+        return
+    new_items, new_ids = _filter_new_items([item], _SHARED_PROCESSED_IDS)
+    if not new_items:
+        return
+    logger.info(f"Augestel Panel {panel_id}: {len(new_items)} new items → delivering")
+    try:
+        await run_db(mark_otp_seen_batch_sync, new_ids)
+    except Exception as e:
+        for mid in new_ids:
+            _SHARED_PROCESSED_IDS.pop(mid, None)
+        logger.error(f"mark_otp_seen failed, rolled back {len(new_ids)}: {e}")
+        return
+    try:
+        await process_otp_items_fast(new_items, _BOT_APP)
+    except Exception as e:
+        logger.exception(f"process_otp_items_fast CRASHED: {e}")
+
+
+@flask_app.route('/webhook/augestel', methods=['POST'])
+@flask_app.route('/webhook/augestel/<panel_id>', methods=['POST'])
+def augestel_webhook(panel_id: Optional[str] = None):
+    raw_body = request.get_data(cache=False)
+    sig_header = (request.headers.get("X-Augestel-Signature") or "").strip()
+    event_header = (request.headers.get("X-Augestel-Event") or "").strip()
+    ts_header = (request.headers.get("X-Augestel-Timestamp") or "").strip()
+
+    if not sig_header:
+        return jsonify({"error": "missing signature"}), 401
+
+    candidates = _get_augestel_panels_cached(force_refresh=False)
+    if panel_id is not None:
+        candidates = [p for p in candidates if str(p.get("id")) == str(panel_id)]
+
+    matched_panel = None
+    for p in candidates:
+        if _verify_augestel_signature(raw_body, _get_augestel_secret(p), sig_header):
+            matched_panel = p
+            break
+
+    if matched_panel is None and (time.time() - _AUGESTEL_PANELS_CACHE["ts"]) > 2.0:
+        candidates = _get_augestel_panels_cached(force_refresh=True)
+        if panel_id is not None:
+            candidates = [p for p in candidates if str(p.get("id")) == str(panel_id)]
+        for p in candidates:
+            if _verify_augestel_signature(raw_body, _get_augestel_secret(p), sig_header):
+                matched_panel = p
+                break
+
+    if matched_panel is None:
+        if not candidates:
+            return jsonify({"error": "augestel panel not found"}), 404
+        return jsonify({"error": "invalid signature"}), 401
+
+    pid = str(matched_panel["id"])
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return jsonify({"error": "invalid json"}), 400
+
+    if not isinstance(payload, dict):
+        return jsonify({"error": "invalid payload"}), 400
+
+    event_name = event_header or str(payload.get("event") or "").strip()
+    if event_name != "message.received":
+        AUGESTEL_PANEL_STATUS[pid] = f"✅ Verified ({event_name or 'event'})"
+        return jsonify({"status": "ok"}), 200
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return jsonify({"error": "invalid data"}), 400
+
+    raw_number = str(data.get("number") or "").strip()
+    clean_num = re.sub(r'\D', '', raw_number)
+    msg_text = str(data.get("message") or "")
+    if not clean_num or not msg_text:
+        return jsonify({"status": "ok"}), 200
+
+    dt_val = (
+        data.get("received_at")
+        or data.get("received\\_at")
+        or payload.get("timestamp")
+        or ts_header
+        or ""
+    )
+    source_val = str(data.get("source") or "").strip()
+
+    item = {
+        "num": clean_num,
+        "message": msg_text,
+        "dt": str(dt_val),
+        "payout": 1,
+        "cli": source_val,
+    }
+
+    if _MAIN_LOOP is None or _BOT_APP is None or not _MAIN_LOOP.is_running():
+        return jsonify({"error": "bot starting"}), 503
+
+    AUGESTEL_PANEL_COUNTS[pid] = AUGESTEL_PANEL_COUNTS.get(pid, 0) + 1
+    tail = clean_num[-4:] if len(clean_num) >= 4 else clean_num
+    AUGESTEL_PANEL_STATUS[pid] = f"✅ Received: {AUGESTEL_PANEL_COUNTS[pid]} | Last: ..{tail}"
+
+    asyncio.run_coroutine_threadsafe(_process_augestel_webhook_item(pid, item), _MAIN_LOOP)
+    return jsonify({"status": "ok"}), 200
+
+
 @flask_app.route('/')
 def home():
     return f"Bot running! DB Mode: {CURRENT_DB_MODE}"
@@ -3026,7 +3039,6 @@ def health():
         "services": len(SERVICES_CACHE),
         "panels": len(PANEL_TASKS),
         "captcha_sessions": len(CAPTCHA_SESSIONS),
-        "html_scrape_sessions": len(HTML_SCRAPE_SESSIONS),
         "batch_rpc": "enabled" if _BATCH_RPC_AVAILABLE else "fallback",
         "firebase": "connected" if firebase_db_ref else "disabled",
         "otp_retention_days": OTP_ID_RETENTION_SECONDS // 86400,
@@ -3034,8 +3046,6 @@ def health():
         "chat_locks": len(_CHAT_LOCKS),
         "force_join_enabled": is_force_join_enabled(),
         "refer_enabled": get_setting("refer_enabled", "true") == "true",
-        "html_engine": HTML_ENGINE,
-        "zenrows_api_key_set": bool(ZENROWS_API_KEY),
     })
 
 
@@ -3065,10 +3075,10 @@ def run_flask():
     WAIT_REFER_PERCENT,
     WAIT_CC_LENGTH,
     WAIT_USER_SEARCH,
-    WAIT_COUNTRY_SHORT,
-    # 🌐 HTML Scrape Panel States
-    WAIT_HS_NAME, WAIT_HS_LOGIN_URL, WAIT_HS_EMAIL, WAIT_HS_PASSWORD, WAIT_HS_LIVE_URL,
-) = range(56)
+    WAIT_COUNTRY_SHORT,   # 🆕 Country short form state
+    WAIT_AUGESTEL_SECRET,
+    WAIT_AUGESTEL_DOMAIN,
+) = range(53)
 
 
 def admin_only(func):
@@ -3141,10 +3151,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'map_payout_path', 'map_cli_path', 'new_api_interval',
                 'cpt_login_url', 'cpt_username', 'cpt_password', 'cpt_msg_link',
                 'cpt_num_col_name', 'cpt_num_col_idx', 'cpt_msg_col_name',
-                'cpt_msg_col_idx', 'cpt_dt_col_name', 'cpt_dt_col_idx',
                 'fj_chat_id', 'fj_chat_title', 'fj_chat_link', 'cc_length',
-                'country_short',
-                'hs_login_url', 'hs_email', 'hs_password', 'hs_live_url'):
+                'country_short'):
         context.user_data.pop(key, None)
 
     context.user_data['current_menu'] = 'main'
@@ -3773,6 +3781,7 @@ async def receive_service_name(update: Update, context: ContextTypes.DEFAULT_TYP
     return ADD_COUNTRY
 
 
+# 🆕 MODIFIED: Ask for country short form BEFORE payout
 async def receive_country_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     country = update.message.text.strip()
     context.user_data['country_name'] = country
@@ -3798,6 +3807,7 @@ async def receive_country_name(update: Update, context: ContextTypes.DEFAULT_TYP
     return WAIT_COUNTRY_SHORT
 
 
+# 🆕 NEW: Receive country short form, save it, then ask for payout
 async def receive_country_short(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip()
     country = context.user_data.get('country_name', '')
@@ -3926,18 +3936,17 @@ async def admin_add_captcha_panel_start(update: Update, context: ContextTypes.DE
 
 
 @admin_only
-async def admin_add_html_scrape_panel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['panel_flow'] = 'html_scrape'
-    zen_status = "🟢 ZenRows API key set" if ZENROWS_API_KEY else "🔴 ZENROWS_API_KEY NOT set"
+async def admin_add_augestel_panel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['panel_flow'] = 'augestel'
+    preview_ep = _get_augestel_endpoint_url("<PANEL_ID>")
     await update.callback_query.message.reply_text(
-        "🌐 **HTML SCRAPE PANEL SETUP**\n\n"
-        "This panel logs in via HTTP form and scrapes the live SMS page.\n"
-        "Cloudflare bypass is handled by **ZenRows** (hosted API).\n\n"
-        f"🚀 **Engine Status:** {zen_status}\n\n"
-        "**Step 1/5:** Enter a panel name (e.g., `Augestel`):",
+        "🪝 **AUGESTEL PANEL SETUP**\n\n"
+        "This panel receives OTPs via Webhook (`message.received`) without polling.\n"
+        f"🎯 **Endpoint Format:** `{preview_ep}`\n\n"
+        "**Step 1/2:** Enter the Panel Name (e.g., `Augestel Panel`):",
         parse_mode="Markdown"
     )
-    return WAIT_HS_NAME
+    return WAIT_PANEL_NAME
 
 
 async def receive_panel_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3958,88 +3967,104 @@ async def receive_panel_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return WAIT_CPT_LOGIN_URL
 
-    elif flow == 'html_scrape':
+    elif flow == 'augestel':
         await update.message.reply_text(
-            "**Step 2/5:** Enter the **Login URL** (e.g., `https://augestel.com/Switchfy`):\n"
-            "⚠️ Do NOT include `/login` at the end — bot adds it automatically.",
+            "**Step 2/2:** Enter your Augestel **Webhook Signing Secret** (for `X-Augestel-Signature` HMAC-SHA256 verification):",
             parse_mode="Markdown"
         )
-        return WAIT_HS_LOGIN_URL
+        return WAIT_AUGESTEL_SECRET
 
     else:
         await update.message.reply_text("Enter Base API URL (e.g., http://domain.com/viewstasx):")
         return WAIT_PANEL_URL
 
 
-async def receive_hs_login_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    if not url.startswith("http"):
-        url = "https://" + url
-    if url.rstrip("/").endswith("/login"):
-        url = url.rstrip("/")[:-6]
-    context.user_data['hs_login_url'] = url.rstrip("/")
-    await update.message.reply_text(
-        "**Step 3/5:** Enter the login **email / username**:"
-    )
-    return WAIT_HS_EMAIL
+async def receive_augestel_secret(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    secret = update.message.text.strip()
+    if not secret:
+        await update.message.reply_text("❌ Signing secret cannot be empty. Please enter your Augestel Webhook Signing Secret:")
+        return WAIT_AUGESTEL_SECRET
 
-
-async def receive_hs_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['hs_email'] = update.message.text.strip()
-    await update.message.reply_text("**Step 4/5:** Enter the **password**:")
-    return WAIT_HS_PASSWORD
-
-
-async def receive_hs_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['hs_password'] = update.message.text.strip()
-    await update.message.reply_text(
-        "**Step 5/5:** Enter the **Live SMS page URL**\n"
-        "Example: `https://augestel.com/Switchfy/client/live-sms`",
-        parse_mode="Markdown"
-    )
-    return WAIT_HS_LIVE_URL
-
-
-async def receive_hs_live_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    if not url.startswith("http"):
-        await update.message.reply_text("❌ URL must start with http:// or https://\nType /cancel to abort.")
-        return WAIT_HS_LIVE_URL
-    context.user_data['hs_live_url'] = url
-
+    p_name = context.user_data.get('new_api_name') or "Augestel panel"
     cfg = {
-        "_panel_type": "html_scrape",
-        "login_url": context.user_data.get('hs_login_url', ''),
-        "username": context.user_data.get('hs_email', ''),
-        "password": context.user_data.get('hs_password', ''),
-        "live_url": url,
+        "_panel_type": "augestel",
+        "webhook_secret": secret,
     }
-    p_name = context.user_data.get('new_api_name', '')
-    p_interval = 10.0
+    pid = await run_db(
+        save_api_panel_sync,
+        p_name,
+        "webhook://augestel",
+        secret,
+        5.0,
+        json.dumps(cfg),
+    )
 
-    if p_name and cfg["login_url"]:
-        pid = await run_db(save_api_panel_sync, p_name, cfg["login_url"], "", p_interval, json.dumps(cfg))
-        engine = f"{HTML_ENGINE}" if ZENROWS_API_KEY else "❌ ZENROWS_API_KEY not set"
+    if pid:
+        AUGESTEL_PANEL_STATUS[str(pid)] = "🟢 Webhook Ready"
+        exact_endpoint = _get_augestel_endpoint_url(str(pid))
+        safe_pname = str(p_name).replace("`", "")
+        copy_kbd = InlineKeyboardMarkup([
+            [create_button("📋 Copy Dashboard Endpoint", copy_text=exact_endpoint, style="success")]
+        ])
         await update.message.reply_text(
-            f"✅ **HTML Scrape Panel Added!**\n\n"
-            f"📌 Name: `{escape_md(p_name)}`\n"
-            f"🌐 Login: `{escape_md(cfg['login_url'])}`\n"
-            f"👤 User: `{escape_md(cfg['username'])}`\n"
-            f"📄 Live: `{escape_md(cfg['live_url'])}`\n"
-            f"⏱️ Polling: `{p_interval}s`\n"
-            f"🚀 Engine: `{engine}`\n\n"
-            f"Bot will login and start scraping shortly.\n"
-            f"Use **🧪 Test Scrape** in panel details to verify.",
+            f"✅ **Augestel Panel Connected!**\n\n"
+            f"📌 **Name:** `{safe_pname}`\n"
+            f"🧩 **Mode:** `Webhook (No Polling)`\n"
+            f"🎯 **Set this Exact Endpoint in Augestel Dashboard:**\n"
+            f"`{exact_endpoint}`\n"
+            f"🛣️ **Method:** `POST`\n"
+            f"📡 **Event:** `message.received`",
+            reply_markup=copy_kbd,
             parse_mode="Markdown"
         )
     else:
-        await update.message.reply_text("❌ Incomplete panel data.")
+        await update.message.reply_text("❌ Failed to save Augestel panel.")
 
-    for k in ('new_api_name', 'panel_flow', 'hs_login_url', 'hs_email', 'hs_password', 'hs_live_url'):
-        context.user_data.pop(k, None)
+    for key in ('new_api_name', 'panel_flow'):
+        context.user_data.pop(key, None)
 
-    text_msg, kbd = build_api_panels_view()
+    text_msg, kbd = await run_db(build_api_panels_view)
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+@admin_only
+async def admin_set_augestel_domain_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = update.callback_query.data
+    panel_id = data.split(":", 3)[3]
+    context.user_data['aug_domain_panel_id'] = panel_id
+    curr = _get_webhook_base_url() or "Not set"
+    await update.callback_query.message.reply_text(
+        "🌐 **SET WEBHOOK SERVER DOMAIN / BASE URL**\n\n"
+        f"Current Base URL: `{curr.replace('`', '')}`\n\n"
+        "Enter your bot server's public URL or domain (e.g., `https://bot.yourdomain.com` or `http://123.45.67.89:8080`),\n"
+        "or type `auto` to use automatic host detection:",
+        parse_mode="Markdown"
+    )
+    return WAIT_AUGESTEL_DOMAIN
+
+
+async def receive_augestel_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw_val = update.message.text.strip().rstrip("/")
+    panel_id = context.user_data.pop('aug_domain_panel_id', None)
+    if raw_val.lower() in ("auto", "reset", "clear"):
+        await run_db(set_setting, "webhook_base_url", "")
+    else:
+        if not raw_val.startswith(("http://", "https://")):
+            raw_val = f"https://{raw_val}"
+        await run_db(set_setting, "webhook_base_url", raw_val)
+
+    if panel_id:
+        exact_ep = _get_augestel_endpoint_url(str(panel_id))
+        await update.message.reply_text(
+            f"✅ **Augestel Dashboard Endpoint Updated!**\n\n`{exact_ep}`",
+            parse_mode="Markdown"
+        )
+        text_msg, kbd = await run_db(build_panel_manage_view, str(panel_id))
+        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    else:
+        text_msg, kbd = await run_db(build_api_panels_view)
+        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -4535,7 +4560,7 @@ async def set_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
-    if not (new_link.startswith("http://") or new_link.startswith("https://") or new_link.startswith("t.me/") or new_link.startswith("@") or new_link.startswith("@")):
+    if not (new_link.startswith("http://") or new_link.startswith("https://") or new_link.startswith("t.me/") or new_link.startswith("@")):
         await update.message.reply_text("❌ Invalid link! Please enter a valid URL or Telegram username.\nType /cancel to abort.")
         return WAIT_CHANNEL
     await run_db(set_setting, "channel", new_link)
@@ -4588,6 +4613,7 @@ async def set_otpgroupid_start(update: Update, context: ContextTypes.DEFAULT_TYP
     if update.callback_query:
         await update.callback_query.message.reply_text("Enter the OTP Forward Group Chat ID (e.g., -1001234567890):")
     return WAIT_OTP_GROUP_ID
+
 
 
 async def receive_otp_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4686,8 +4712,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'cpt_num_col_name', 'cpt_num_col_idx', 'cpt_msg_col_name',
                 'cpt_msg_col_idx', 'cpt_dt_col_name', 'cpt_dt_col_idx',
                 'fj_chat_id', 'fj_chat_title', 'fj_chat_link', 'cc_length',
-                'country_short',
-                'hs_login_url', 'hs_email', 'hs_password', 'hs_live_url'):
+                'country_short', 'aug_domain_panel_id'):
         context.user_data.pop(key, None)
 
     if update.message and update.message.text:
@@ -5115,86 +5140,61 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, kbd = await run_db(build_panel_manage_view, panel_id)
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
-    elif data.startswith("adm:api:test_html:"):
-        if not user_is_admin: await query.answer(); return
-        await query.answer("Testing scrape via ZenRows...")
-        panel_id = data.split(":", 3)[3]
-        p = await run_db(get_api_panel_sync, panel_id)
-        if not p:
-            await query.edit_message_text("⚠️ Panel not found.")
-            return
-
-        if not ZENROWS_API_KEY:
-            await query.edit_message_text(
-                "❌ <b>ZENROWS_API_KEY not set!</b>\n\n"
-                "Add it to Render Environment Variables and restart the bot.",
-                parse_mode="HTML"
-            )
-            return
-
-        try:
-            cfg = json.loads(p.get("mapping_json") or "{}")
-        except Exception:
-            cfg = {}
-
-        HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)
-
-        ok, status = await attempt_html_login(str(panel_id), p, cfg)
-        if not ok:
-            HTML_SCRAPE_STATUS[str(panel_id)] = status
-            kbd = InlineKeyboardMarkup([[
-                create_button("Back", callback_data=f"adm:api:view:{panel_id}", style="primary")
-            ]])
-            await query.edit_message_text(
-                f"❌ <b>Login Failed</b>\n\n"
-                f"<b>Status:</b>\n<pre>{html.escape(status[:1500])}</pre>\n\n"
-                f"<b>Login URL:</b> <code>{html.escape(cfg.get('login_url',''))}</code>\n"
-                f"<b>Live URL:</b> <code>{html.escape(cfg.get('live_url',''))}</code>\n"
-                f"<b>Engine:</b> {HTML_ENGINE}",
-                reply_markup=kbd, parse_mode="HTML"
-            )
-            return
-
-        items, fetch_status = await fetch_html_scrape_items(str(panel_id), cfg)
-        HTML_SCRAPE_STATUS[str(panel_id)] = fetch_status
-
-        preview = ""
-        for i, it in enumerate(items[:5], 1):
-            otp_code = extract_otp(it["message"])
-            preview += (
-                f"\n<b>{i}.</b> 📱 <code>{html.escape(it['num'])}</code> "
-                f"| <b>{html.escape(it.get('cli', '') or '-')}</b>\n"
-                f"   🔐 OTP: <code>{html.escape(otp_code)}</code>\n"
-                f"   💬 <code>{html.escape(it['message'][:100])}</code>\n"
-                f"   🆔 <code>{html.escape(it.get('_raw_id','')[:30])}</code>\n"
-            )
-        if not preview:
-            preview = (
-                "\n<i>No rows found.</i>\n"
-                f"<b>Live URL:</b> <code>{html.escape(cfg.get('live_url',''))}</code>\n"
-                f"<b>Login URL:</b> <code>{html.escape(cfg.get('login_url',''))}</code>\n"
-                "Check that the Live URL is the actual SMS page and not a redirect."
-            )
-
-        kbd = InlineKeyboardMarkup([[
-            create_button("Back", callback_data=f"adm:api:view:{panel_id}", style="primary")
-        ]])
-        await query.edit_message_text(
-            f"✅ <b>Scrape OK</b>\n"
-            f"Status: <code>{html.escape(fetch_status)}</code>\n"
-            f"Total: <b>{len(items)}</b> items\n"
-            f"Engine: {HTML_ENGINE}\n"
-            f"{preview}",
-            reply_markup=kbd, parse_mode="HTML"
-        )
-
     elif data.startswith("adm:api:test:"):
         if not user_is_admin: await query.answer(); return
-        await query.answer("Fetching...")
+        await query.answer("Testing...")
         panel_id = data.split(":", 3)[3]
         p = await run_db(get_api_panel_sync, panel_id)
         if not p:
             await query.edit_message_text("⚠️ Panel not found.")
+            return
+
+        if get_panel_type(p) == "augestel":
+            secret = _get_augestel_secret(p)
+            sample_raw = (
+                b'{\n'
+                b'  "event": "webhook.self_test",\n'
+                b'  "timestamp": "2025-01-15T10:30:06Z"\n'
+                b'}'
+            )
+            good_sig = "sha256=" + hmac.new(secret.encode("utf-8"), sample_raw, hashlib.sha256).hexdigest()
+            with flask_app.test_client() as tc:
+                ok_res = tc.post(
+                    f"/webhook/augestel/{panel_id}",
+                    data=sample_raw,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Augestel-Event": "webhook.self_test",
+                        "X-Augestel-Signature": good_sig,
+                        "X-Augestel-Timestamp": "2025-01-15T10:30:06Z",
+                    },
+                )
+                bad_res = tc.post(
+                    f"/webhook/augestel/{panel_id}",
+                    data=sample_raw,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Augestel-Event": "webhook.self_test",
+                        "X-Augestel-Signature": "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+                        "X-Augestel-Timestamp": "2025-01-15T10:30:06Z",
+                    },
+                )
+            endpoint_display = _get_augestel_endpoint_url(str(panel_id))
+            sig_ok = (ok_res.status_code == 200 and bad_res.status_code == 401)
+            kbd = InlineKeyboardMarkup([
+                [create_button("📋 Copy Dashboard Endpoint", copy_text=endpoint_display, style="success")],
+                [create_button("Back to Panel", callback_data=f"adm:api:view:{panel_id}", style="primary")]
+            ])
+            await query.edit_message_text(
+                f"🧪 <b>AUGESTEL WEBHOOK SELF-TEST — {html.escape(p['name'])}</b>\n\n"
+                f"• Valid HMAC Signature Test: <code>HTTP {ok_res.status_code}</code>\n"
+                f"• Tampered Signature Reject: <code>HTTP {bad_res.status_code}</code>\n"
+                f"• Verification Result: <b>{'✅ PASSED' if sig_ok else '❌ FAILED'}</b>\n"
+                f"• Dashboard Endpoint: <code>{html.escape(endpoint_display)}</code>\n"
+                f"• Total Received: <b>{AUGESTEL_PANEL_COUNTS.get(str(panel_id), 0)}</b>",
+                reply_markup=kbd,
+                parse_mode="HTML",
+            )
             return
 
         if get_panel_type(p) == "captcha":
@@ -5311,10 +5311,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: await old["client"].aclose()
             except Exception: pass
         CAPTCHA_PANEL_STATUS[str(panel_id)] = "🔄 Re-login triggered"
-        HTML_SCRAPE_SESSIONS.pop(str(panel_id), None)  # ZenRows session needs no explicit close
-        HTML_SCRAPE_STATUS[str(panel_id)] = "🔄 Re-login triggered"
         await query.answer("Session cleared. Will re-login shortly.", show_alert=True)
-        text, kbd = await run_db(build_panel_manage_view, str(panel_id))
+        text, kbd = build_panel_manage_view(str(panel_id))
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:api:delconf:"):
@@ -5441,9 +5439,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _compute_msg_id(item: dict) -> Optional[str]:
     try:
-        raw_id = item.get("_raw_id")
-        if raw_id:
-            return str(raw_id)
         num = str(item.get("num", "")).strip()
         dt = item.get("dt", "")
         msg = item.get("message", "")
@@ -5479,6 +5474,17 @@ def _filter_new_items(items: list, processed_ids: TimedLRUDict) -> Tuple[list, l
     return valid, new_ids
 
 
+# ============================================================
+# 🆕 process_otp_items_fast — NEW OTP Group message format
+#    Format:
+#        {ShortCountry} › {CLI Name}
+#
+#        ☎️ Number: {masked}
+#        ━━━━━━━━━━━━━━━━━
+#        [🗨️ SMS: {message}]   (if show_message on)
+#        ━━━━━━━━━━━━━━━━━
+#        🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {name} ({link})
+# ============================================================
 async def process_otp_items_fast(items: list, application: Application):
     if not items:
         return
@@ -5490,6 +5496,7 @@ async def process_otp_items_fast(items: list, application: Application):
     show_dev_enabled = get_setting("show_developer", "true") == "true"
     dev_username = get_setting("dev_username", "developer")
     dev_link = clean_tg_link(get_setting("dev_link", "https://t.me/developer"))
+    # 🆕 Developer display: clickable name + visible link in parens
     dev_html = f'<a href="{dev_link}">{html.escape(dev_username)}</a>'
     target_otp_group = get_setting("otp_group_id", OTP_GROUP_ID)
 
@@ -5568,6 +5575,7 @@ async def process_otp_items_fast(items: list, application: Application):
             cli = (item.get("cli") or "").strip()
             display_service = cli if cli else (alloc.get("service") or "Service")
 
+            # 🆕 Short country name from settings (falls back to full country)
             short_country = get_country_short_sync(alloc["service"], alloc["country"])
 
             otp_code = extract_otp(msg)
@@ -5578,6 +5586,7 @@ async def process_otp_items_fast(items: list, application: Application):
             safe_masked_num = html.escape(mask_number_aph(num))
             payout_str = fmt_num(item_payout)
 
+            # ── OTP Group message (NEW FORMAT) ──
             if target_otp_group:
                 divider = "━━━━━━━━━━━━━━━━━"
                 if show_msg_enabled:
@@ -5611,6 +5620,7 @@ async def process_otp_items_fast(items: list, application: Application):
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                 ))
 
+            # ── User DM message (unchanged) ──
             if show_msg_enabled:
                 user_text = (
                     "— — — — — — — — — —\n"
@@ -5660,6 +5670,9 @@ async def poll_single_panel(panel_id: str, application: Application,
                 await asyncio.sleep(5)
                 continue
 
+            if get_panel_type(panel) == "augestel":
+                return
+
             url = panel["url"]
             token = panel["token"]
             interval = float(panel.get("polling_interval", 5.0))
@@ -5667,55 +5680,6 @@ async def poll_single_panel(panel_id: str, application: Application,
                 interval = 3.1
             elif interval > 120.0:
                 interval = 120.0
-
-            if get_panel_type(panel) == "html_scrape":
-                try:
-                    cfg = json.loads(panel.get("mapping_json") or "{}")
-                except Exception:
-                    cfg = {}
-
-                sess = HTML_SCRAPE_SESSIONS.get(panel_id)
-                if not sess:
-                    ok, status = await attempt_html_login(panel_id, panel, cfg)
-                    HTML_SCRAPE_STATUS[panel_id] = status
-                    if not ok:
-                        logger.info(f"HTML panel {panel_id}: {status}")
-                        await asyncio.sleep(30)
-                        continue
-
-                items, status = await fetch_html_scrape_items(panel_id, cfg)
-                HTML_SCRAPE_STATUS[panel_id] = status
-
-                status_lower = status.lower()
-                if ("expired" in status_lower
-                        or "error" in status_lower
-                        or "redirect" in status_lower
-                        or "denied" in status_lower):
-                    HTML_SCRAPE_SESSIONS.pop(panel_id, None)
-                    logger.info(f"HTML panel {panel_id}: {status} — forcing re-login")
-                    await asyncio.sleep(5)
-                    continue
-
-                if items:
-                    new_items, new_ids = _filter_new_items(items, processed_ids)
-                    if new_items:
-                        logger.info(f"HTML Scrape Panel {panel_id}: {len(new_items)} new items → delivering")
-                        try:
-                            await run_db(mark_otp_seen_batch_sync, new_ids)
-                        except Exception as e:
-                            for mid in new_ids:
-                                processed_ids.pop(mid, None)
-                            logger.error(f"mark_otp_seen failed, rolled back {len(new_ids)}: {e}")
-                        else:
-                            async def _safe_process_html(it, app):
-                                try:
-                                    await process_otp_items_fast(it, app)
-                                except Exception as e:
-                                    logger.exception(f"process_otp_items_fast CRASHED: {e}")
-                            asyncio.create_task(_safe_process_html(new_items, application))
-
-                await asyncio.sleep(interval)
-                continue
 
             if get_panel_type(panel) == "captcha":
                 try:
@@ -5854,13 +5818,22 @@ async def poll_single_panel(panel_id: str, application: Application,
 
 
 async def otp_poller_manager(application: Application):
-    loaded = await run_db(load_seen_otp_ids_sync) or {}
-    processed_ids = TimedLRUDict(maxsize=PROCESSED_IDS_MAX, ttl=OTP_ID_RETENTION_SECONDS)
-    for mid, ts in loaded.items():
-        try:
-            processed_ids.add(mid, ts=float(ts) if ts else None)
-        except Exception:
-            processed_ids.add(mid)
+    global _SHARED_PROCESSED_IDS
+    if _SHARED_PROCESSED_IDS is not None:
+        processed_ids = _SHARED_PROCESSED_IDS
+    else:
+        processed_ids = TimedLRUDict(maxsize=PROCESSED_IDS_MAX, ttl=OTP_ID_RETENTION_SECONDS)
+        _SHARED_PROCESSED_IDS = processed_ids
+    try:
+        loaded = await run_db(load_seen_otp_ids_sync) or {}
+        for mid, ts in loaded.items():
+            try:
+                processed_ids.add(mid, ts=float(ts) if ts else None)
+            except Exception:
+                processed_ids.add(mid)
+    finally:
+        if _POLLER_READY_EVENT is not None:
+            _POLLER_READY_EVENT.set()
     logger.info(f"OTP Poller Manager started. Loaded {len(processed_ids)} seen OTP ids.")
 
     cycle_count = 0
@@ -5869,7 +5842,8 @@ async def otp_poller_manager(application: Application):
     while True:
         try:
             panels = await run_db(get_all_api_panels_sync)
-            active_ids = {str(p["id"]) for p in panels}
+            polling_panels = [p for p in panels if get_panel_type(p) != "augestel"]
+            active_ids = {str(p["id"]) for p in polling_panels}
 
             for pid in list(PANEL_TASKS.keys()):
                 if pid not in active_ids or PANEL_TASKS[pid].done():
@@ -5877,7 +5851,7 @@ async def otp_poller_manager(application: Application):
                         PANEL_TASKS[pid].cancel()
                     del PANEL_TASKS[pid]
 
-            for p in panels:
+            for p in polling_panels:
                 pid = str(p["id"])
                 if pid not in PANEL_TASKS or PANEL_TASKS[pid].done():
                     PANEL_TASKS[pid] = asyncio.create_task(
@@ -5927,11 +5901,6 @@ def main():
 
     load_known_users()
 
-    if ZENROWS_API_KEY:
-        logger.info(f"ZenRows API key loaded — HTML scrape will use {HTML_ENGINE} for Cloudflare bypass")
-    else:
-        logger.warning("ZENROWS_API_KEY NOT set — HTML scrape Cloudflare bypass disabled. Add it to environment variables.")
-
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info(f"Flask started on port {os.environ.get('PORT', 8080)}")
 
@@ -5949,7 +5918,8 @@ def main():
             CallbackQueryHandler(admin_add_panel_start, pattern="^adm:api:add$"),
             CallbackQueryHandler(admin_add_custom_panel_start, pattern="^adm:api:add_custom$"),
             CallbackQueryHandler(admin_add_captcha_panel_start, pattern="^adm:api:add_captcha$"),
-            CallbackQueryHandler(admin_add_html_scrape_panel_start, pattern="^adm:api:add_html$"),
+            CallbackQueryHandler(admin_add_augestel_panel_start, pattern="^adm:api:add_augestel$"),
+            CallbackQueryHandler(admin_set_augestel_domain_start, pattern="^adm:api:aug_domain:"),
             CallbackQueryHandler(admin_add_admin_start, pattern="^adm:add:start$"),
             CallbackQueryHandler(set_channel_start, pattern="^adm:set:channel$"),
             CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
@@ -5973,6 +5943,7 @@ def main():
         states={
             ADD_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_service_name)],
             ADD_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_country_name)],
+            # 🆕 NEW: country short form is asked right after country name
             WAIT_COUNTRY_SHORT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_country_short)],
             WAIT_PAYOUT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_payout_amount)],
             WAIT_CC_LENGTH: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_cc_length)],
@@ -5999,6 +5970,8 @@ def main():
             WAIT_CPT_MSG_COL_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_cpt_msg_col_idx)],
             WAIT_CPT_DT_COL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_cpt_dt_col_name)],
             WAIT_CPT_DT_COL_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_cpt_dt_col_idx)],
+            WAIT_AUGESTEL_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_augestel_secret)],
+            WAIT_AUGESTEL_DOMAIN: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_augestel_domain)],
             WAIT_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_admin_id)],
             WAIT_ADMIN_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_admin_name)],
             WAIT_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_channel_link)],
@@ -6022,12 +5995,6 @@ def main():
             WAIT_FJ_CHAT_TYPE: [CallbackQueryHandler(handle_fj_chat_type, pattern="^adm:fj_type:")],
             WAIT_REFER_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_refer_pct)],
             WAIT_USER_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_user_search)],
-            # 🌐 HTML Scrape Panel States
-            WAIT_HS_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_panel_name)],
-            WAIT_HS_LOGIN_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_hs_login_url)],
-            WAIT_HS_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_hs_email)],
-            WAIT_HS_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_hs_password)],
-            WAIT_HS_LIVE_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_hs_live_url)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
@@ -6043,10 +6010,16 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_callback))
 
     async def post_init(app: Application):
+        global _MAIN_LOOP, _BOT_APP, _POLLER_READY_EVENT, _SHARED_PROCESSED_IDS
+        _MAIN_LOOP = asyncio.get_running_loop()
+        _BOT_APP = app
+        _POLLER_READY_EVENT = asyncio.Event()
+        _SHARED_PROCESSED_IDS = TimedLRUDict(maxsize=PROCESSED_IDS_MAX, ttl=OTP_ID_RETENTION_SECONDS)
         try:
             await _get_bot_info(app, ttl=0.0)
         except Exception:
             pass
+        await _detect_public_ip_once()
 
         t1 = asyncio.create_task(otp_poller_manager(app))
         t2 = asyncio.create_task(firebase_backup_worker())
@@ -6075,9 +6048,6 @@ def main():
             except Exception:
                 pass
         CAPTCHA_SESSIONS.clear()
-
-        HTML_SCRAPE_SESSIONS.clear()  # ZenRows sessions need no explicit close
-
         try:
             await asyncio.to_thread(push_dirty_to_firebase_sync)
             logger.info("Final Firebase backup complete")
