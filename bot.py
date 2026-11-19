@@ -41,7 +41,7 @@ from telegram import (
     LinkPreviewOptions, Message, KeyboardButton, InlineKeyboardButton,
     MessageEntity,
 )
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter, BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, ConversationHandler, filters,
@@ -115,6 +115,7 @@ LIVE_RECEIVERS_MAX_EVENTS = 500
 LIVE_RECEIVER_EVENTS: deque = deque(maxlen=LIVE_RECEIVERS_MAX_EVENTS)
 _USER_IDENTITY_CACHE: Dict[int, Dict[str, Any]] = {}
 _USER_IDENTITY_CACHE_TTL = 300.0
+_USE_PREMIUM_EMOJIS = True
 
 # 🛡️ ANTI-ABUSE STATE
 _LAST_NUMBER_CLAIM: Dict[int, float] = {}
@@ -324,7 +325,7 @@ AUGESTEL_PROCESSED_OTPS = TimedLRUDict(maxsize=200000, ttl=OTP_ID_RETENTION_SECO
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Ranking|Leaderboard|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Broadcast|Extra|Manage Payouts|User Manager|Live Receivers|Withdraw|Back)$")
+MENU_FILTER = filters.Regex(r"(?i)^(?:[\s\U0001F000-\U0010FFFF\u2600-\u27BF\u25A0-\u25FF\uFE0F\u200D]*)(Get Number|Profile|Wallet|Ranking|Leaderboard|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Broadcast|Extra|Manage Payouts|User Manager|Live Receivers|Withdraw|Back)$")
 
 
 # ---------------- HELPERS ----------------
@@ -487,6 +488,127 @@ def create_button(text: str, callback_data: str = None, url: str = None,
         kwargs["icon_custom_emoji_id"] = final_emoji
 
     return InlineKeyboardButton(**kwargs)
+
+
+def _is_premium_emojis_enabled(use_premium: Optional[bool] = None) -> bool:
+    if use_premium is None:
+        return _USE_PREMIUM_EMOJIS
+    return bool(use_premium)
+
+
+def _tg_emoji(emoji_id: str, fallback: str, use_premium: Optional[bool] = None) -> str:
+    if _is_premium_emojis_enabled(use_premium) and emoji_id:
+        return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+    return fallback
+
+
+def _unwrap_tg_emojis(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>', r'\1', str(text))
+
+
+def _clean_menu_text(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(
+        r'^[\s\U0001F000-\U0010FFFF\u2600-\u27BF\u25A0-\u25FF\uFE0F\u200D]+',
+        '',
+        str(text),
+    ).strip()
+
+
+def _admin_inline_btn(
+    label: str,
+    callback_data: str,
+    style: str = "primary",
+    emoji_id: Optional[str] = None,
+    fallback_emoji: str = "",
+    use_premium: Optional[bool] = None,
+    emoji_after: bool = False,
+) -> InlineKeyboardButton:
+    premium = _is_premium_emojis_enabled(use_premium)
+    if premium and emoji_id:
+        return create_button(label, callback_data=callback_data, style=style, icon_custom_emoji_id=emoji_id)
+    if fallback_emoji:
+        btn_label = f"{label} {fallback_emoji}".strip() if emoji_after else f"{fallback_emoji} {label}".strip()
+    else:
+        btn_label = label
+    return create_button(btn_label, callback_data=callback_data, style=style)
+
+
+def _is_premium_emoji_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    if "not modified" in msg:
+        return False
+    return any(tok in msg for tok in (
+        "custom_emoji", "custom emoji", "icon_custom_emoji",
+        "document_invalid", "emoji", "button_type_invalid",
+        "tg-emoji", "premium", "sticker",
+    ))
+
+
+async def _reply_with_emoji_fallback(
+    message,
+    builder_fn,
+    parse_mode: Optional[str] = None,
+    link_preview_options=None,
+):
+    global _USE_PREMIUM_EMOJIS
+    use_prem = _USE_PREMIUM_EMOJIS
+    text_msg, kbd = builder_fn(use_prem)
+    kwargs: Dict[str, Any] = {"reply_markup": kbd}
+    if parse_mode:
+        kwargs["parse_mode"] = parse_mode
+    if link_preview_options is not None:
+        kwargs["link_preview_options"] = link_preview_options
+
+    try:
+        return await message.reply_text(text_msg, **kwargs)
+    except BadRequest as e:
+        if use_prem and _is_premium_emoji_error(e):
+            logger.warning(f"Premium emoji rejected on reply_text ({e}); falling back to normal emojis.")
+            _USE_PREMIUM_EMOJIS = False
+            text_msg, kbd = builder_fn(False)
+            kwargs["reply_markup"] = kbd
+            return await message.reply_text(_unwrap_tg_emojis(text_msg), **kwargs)
+        raise
+
+
+async def _edit_with_emoji_fallback(
+    query,
+    builder_fn,
+    parse_mode: Optional[str] = None,
+    link_preview_options=None,
+) -> str:
+    global _USE_PREMIUM_EMOJIS
+    use_prem = _USE_PREMIUM_EMOJIS
+    text_msg, kbd = builder_fn(use_prem)
+    kwargs: Dict[str, Any] = {"reply_markup": kbd}
+    if parse_mode:
+        kwargs["parse_mode"] = parse_mode
+    if link_preview_options is not None:
+        kwargs["link_preview_options"] = link_preview_options
+
+    try:
+        await query.edit_message_text(text_msg, **kwargs)
+        return "modified"
+    except BadRequest as e:
+        if "not modified" in str(e).lower():
+            return "not_modified"
+        if use_prem and _is_premium_emoji_error(e):
+            logger.warning(f"Premium emoji rejected on edit_message_text ({e}); falling back to normal emojis.")
+            _USE_PREMIUM_EMOJIS = False
+            text_msg, kbd = builder_fn(False)
+            kwargs["reply_markup"] = kbd
+            try:
+                await query.edit_message_text(_unwrap_tg_emojis(text_msg), **kwargs)
+                return "modified"
+            except BadRequest as retry_err:
+                if "not modified" in str(retry_err).lower():
+                    return "not_modified"
+                raise
+        raise
 
 
 def mask_number_aph(num_str: str) -> str:
@@ -2935,7 +3057,7 @@ def cleanup_old_otp_ids_sync():
         logger.error(f"Supabase cleanup seen otps error: {e}")
 
 
-def build_admin_control_view():
+def build_admin_control_view(use_premium: Optional[bool] = None):
     admins = get_all_admins_sync()
     text = "🛠 **ADMIN CONTROL MANAGEMENT**\n\nList of System Admins:\n"
     buttons = []
@@ -2947,9 +3069,29 @@ def build_admin_control_view():
         role_label = "👑 Main Owner" if is_owner else "🛡️ Admin"
         text += f"\n• **{escape_md(name)}** (`{uid}`) - {role_label}"
         if not is_owner:
-            buttons.append([create_button(f"Remove {name}", callback_data=f"adm:delconf:{uid}", style="danger", icon_custom_emoji_id="5422557736330106570")])
+            buttons.append([_admin_inline_btn(
+                f"Remove {name}", callback_data=f"adm:delconf:{uid}",
+                style="danger", emoji_id="5422557736330106570",
+                fallback_emoji="🗑️", use_premium=use_premium,
+            )])
 
-    buttons.append([create_button("Add New Admin", callback_data="adm:add:start", style="success", icon_custom_emoji_id="5287354223141342798")])
+    buttons.append([_admin_inline_btn(
+        "Add New Admin", callback_data="adm:add:start",
+        style="success", emoji_id="5287354223141342798",
+        fallback_emoji="➕", use_premium=use_premium,
+    )])
+    buttons.append([
+        _admin_inline_btn(
+            "Back to User Manager", callback_data="adm:usr:manager",
+            style="primary", emoji_id="5456187398977247949",
+            fallback_emoji="◀️", use_premium=use_premium,
+        ),
+        _admin_inline_btn(
+            "Back to Panel", callback_data="adm:panel_back",
+            style="danger", emoji_id="5456187398977247949",
+            fallback_emoji="◀️", use_premium=use_premium,
+        ),
+    ])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -2970,6 +3112,9 @@ def _filter_live_events(filter_mode: str = "all") -> list:
     snapshot = list(LIVE_RECEIVER_EVENTS)
     snapshot.reverse()  # newest first
     now = time.time()
+    if filter_mode == "5m":
+        cutoff = now - 300
+        return [ev for ev in snapshot if ev.get("ts", 0) >= cutoff]
     if filter_mode == "15m":
         cutoff = now - 900
         return [ev for ev in snapshot if ev.get("ts", 0) >= cutoff]
@@ -2979,30 +3124,68 @@ def _filter_live_events(filter_mode: str = "all") -> list:
     return snapshot
 
 
-def build_live_receivers_view(filter_mode: str = "all", page: int = 1) -> Tuple[str, InlineKeyboardMarkup]:
-    if filter_mode not in ("all", "15m", "1h"):
+def _truncate_text(val: str, max_len: int) -> str:
+    val = str(val or "").strip()
+    if len(val) <= max_len:
+        return val
+    return val[: max(1, max_len - 1)].rstrip() + "…"
+
+
+def _format_live_service(raw_service: str, use_premium: bool) -> str:
+    clean_srv = _cb_clean(raw_service or "Service") or "Service"
+    clean_srv = _truncate_text(clean_srv, 22)
+    if use_premium:
+        # Preserve a leading <tg-emoji> icon if the service name itself starts with one
+        m = re.match(r'^(\s*<tg-emoji emoji-id="\d+">.*?</tg-emoji>\s*)', str(raw_service or ""))
+        if m:
+            return f"{m.group(1).strip()} {html.escape(clean_srv)}".strip()
+    return html.escape(clean_srv)
+
+
+def build_live_receivers_view(
+    filter_mode: str = "all",
+    page: int = 1,
+    use_premium: Optional[bool] = None,
+) -> Tuple[str, InlineKeyboardMarkup]:
+    premium = _is_premium_emojis_enabled(use_premium)
+    if filter_mode not in ("5m", "15m", "1h", "all"):
         filter_mode = "all"
 
     events = _filter_live_events(filter_mode)
     total_events = len(events)
     unique_receivers = len({ev["user_id"] for ev in events})
 
-    per_page = 8
+    per_page = 25
     total_pages = max(1, (total_events + per_page - 1) // per_page)
     page = max(1, min(page, total_pages))
     start_idx = (page - 1) * per_page
     page_events = events[start_idx:start_idx + per_page]
 
-    filter_labels = {"all": "All Recent", "15m": "Last 15m", "1h": "Last 1h"}
+    filter_labels = {
+        "5m": "Last 5m",
+        "15m": "Last 15m",
+        "1h": "Last 1h",
+        "all": "All Recent",
+    }
     now_bd = datetime.datetime.now(_BD_TZ).strftime("%H:%M:%S")
 
+    e_live = _tg_emoji("5352877703043258544", "📡", premium)
+    e_search = _tg_emoji("5352922460897452503", "🔍", premium)
+    e_msg = _tg_emoji("5472239203590888751", "📨", premium)
+    e_group = _tg_emoji("6307589808424228455", "👥", premium)
+    e_clock = _tg_emoji("5472239203590888751", "⏱️", premium)
+    e_globe = _tg_emoji("5375177250553487549", "🌍", premium)
+    e_tag = _tg_emoji("5258096772776991776", "🏷️", premium)
+    e_phone = _tg_emoji("5404435834789187002", "📞", premium)
+    e_user = _tg_emoji("6307589808424228455", "👤", premium)
+
     text = (
-        f"📡 <b>LIVE OTP RECEIVERS</b>\n"
+        f"{e_live} <b>LIVE OTP RECEIVERS</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔍 Filter: <b>{filter_labels[filter_mode]}</b>  •  "
-        f"📨 OTPs: <code>{total_events}</code>  •  "
-        f"👥 Active: <code>{unique_receivers}</code>\n"
-        f"🕒 Updated: <code>{now_bd}</code>  •  Page <code>{page}/{total_pages}</code>\n"
+        f"{e_search} {filter_labels[filter_mode]} • "
+        f"{e_msg} {total_events} • "
+        f"{e_group} {unique_receivers}\n"
+        f"{e_clock} {now_bd} • Page {page}/{total_pages}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
     )
 
@@ -3012,54 +3195,110 @@ def build_live_receivers_view(filter_mode: str = "all", page: int = 1) -> Tuple[
             "<i>Incoming OTPs will appear here automatically as users receive them.</i>\n"
         )
     else:
+        plain_len = len(re.sub(r'<[^>]+>', '', text))
         for idx, ev in enumerate(page_events, start=start_idx + 1):
             uid = ev["user_id"]
-            fname = ev.get("first_name") or f"User {uid}"
+            fname = _truncate_text(ev.get("first_name") or f"User {uid}", 24)
             uname = (ev.get("username") or "").strip().lstrip("@")
             user_link = f'<a href="tg://user?id={uid}">{html.escape(fname)}</a>'
-            uname_part = f" (@{html.escape(uname)})" if uname else ""
+            uname_part = f" (@{html.escape(_truncate_text(uname, 24))})" if uname else ""
 
-            service = safe_html_escape(ev.get("service") or "Service")
-            country = html.escape(strip_all_emojis(ev.get("country") or "Unknown") or str(ev.get("country") or "Unknown"))
+            service = _format_live_service(ev.get("service") or "Service", premium)
+            raw_country = strip_all_emojis(ev.get("country") or "") or str(ev.get("country") or "Unknown")
+            country = html.escape(_truncate_text(raw_country, 16))
             number = html.escape(str(ev.get("number") or ""))
-            otp_code = html.escape(str(ev.get("otp_code") or "N/A"))
             ts = float(ev.get("ts") or time.time())
             bd_time = datetime.datetime.fromtimestamp(ts, _BD_TZ).strftime("%H:%M:%S")
             rel_time = _format_relative_time(ts)
 
-            text += (
-                f"\n<b>{idx}.</b> 👤 {user_link}{uname_part} • <code>{uid}</code>\n"
-                f"   🏷️ {service} • 🌍 {country}\n"
-                f"   📞 <code>{number}</code> • 🔐 <code>{otp_code}</code> • ⏱️ {rel_time} (<code>{bd_time}</code>)\n"
+            entry = (
+                f"\n{idx}. {e_globe} {country} {e_tag} {service} • {e_phone} {number} • {e_clock} {rel_time} ({bd_time})\n"
+                f"    - {e_user} {user_link}{uname_part}\n"
             )
+            entry_plain_len = len(re.sub(r'<[^>]+>', '', entry))
+            if plain_len + entry_plain_len > 3950:
+                text += "\n<i>…trimmed to fit Telegram message limit.</i>\n"
+                break
+            text += entry
+            plain_len += entry_plain_len
 
-    buttons = [
-        [
-            create_button("All" if filter_mode != "all" else "• All •", callback_data="adm:live:page:all:1", style="success" if filter_mode == "all" else "primary"),
-            create_button("15m" if filter_mode != "15m" else "• 15m •", callback_data="adm:live:page:15m:1", style="success" if filter_mode == "15m" else "primary"),
-            create_button("1h" if filter_mode != "1h" else "• 1h •", callback_data="adm:live:page:1h:1", style="success" if filter_mode == "1h" else "primary"),
-        ]
-    ]
+    filter_row = []
+    for mode, lbl in (("5m", "5m"), ("15m", "15m"), ("1h", "1h"), ("all", "All")):
+        is_active = (filter_mode == mode)
+        btn_text = f"• {lbl} •" if is_active else lbl
+        filter_row.append(_admin_inline_btn(
+            btn_text,
+            callback_data=f"adm:live:page:{mode}:1",
+            style="success" if is_active else "primary",
+            emoji_id="5472239203590888751" if mode != "all" else "5352922460897452503",
+            fallback_emoji="⏱️" if mode != "all" else "🔍",
+            use_premium=premium,
+        ))
+
+    buttons = [filter_row]
 
     if total_pages > 1:
         nav_row = []
         if page > 1:
-            nav_row.append(create_button("◀️ Prev", callback_data=f"adm:live:page:{filter_mode}:{page - 1}", style="primary"))
+            nav_row.append(_admin_inline_btn(
+                "Prev",
+                callback_data=f"adm:live:page:{filter_mode}:{page - 1}",
+                style="primary",
+                emoji_id="5456187398977247949",
+                fallback_emoji="◀️",
+                use_premium=premium,
+            ))
         nav_row.append(create_button(f"{page}/{total_pages}", callback_data="noop", style="primary"))
         if page < total_pages:
-            nav_row.append(create_button("Next ▶️", callback_data=f"adm:live:page:{filter_mode}:{page + 1}", style="primary"))
+            nav_row.append(_admin_inline_btn(
+                "Next",
+                callback_data=f"adm:live:page:{filter_mode}:{page + 1}",
+                style="primary",
+                emoji_id="5370604433233177619",
+                fallback_emoji="▶️",
+                use_premium=premium,
+                emoji_after=True,
+            ))
         buttons.append(nav_row)
 
     buttons.append([
-        create_button("🔄 Refresh", callback_data=f"adm:live:page:{filter_mode}:{page}", style="success"),
-        create_button("👥 Active Summary", callback_data=f"adm:live:summary:{filter_mode}:1", style="primary"),
+        _admin_inline_btn(
+            "Refresh",
+            callback_data=f"adm:live:page:{filter_mode}:{page}",
+            style="success",
+            emoji_id="5244758760429213978",
+            fallback_emoji="🔄",
+            use_premium=premium,
+        ),
+        _admin_inline_btn(
+            "Active Summary",
+            callback_data=f"adm:live:summary:{filter_mode}:1",
+            style="primary",
+            emoji_id="6307589808424228455",
+            fallback_emoji="👥",
+            use_premium=premium,
+        ),
     ])
-    buttons.append([create_button("Back to Panel", callback_data="adm:panel_back", style="danger", icon_custom_emoji_id="5456187398977247949")])
+    buttons.append([
+        _admin_inline_btn(
+            "Back to Panel",
+            callback_data="adm:panel_back",
+            style="danger",
+            emoji_id="5456187398977247949",
+            fallback_emoji="◀️",
+            use_premium=premium,
+        )
+    ])
     return text, InlineKeyboardMarkup(buttons)
 
 
-def build_live_receivers_summary_view(filter_mode: str = "all", page: int = 1) -> Tuple[str, InlineKeyboardMarkup]:
-    if filter_mode not in ("all", "15m", "1h"):
+def build_live_receivers_summary_view(
+    filter_mode: str = "all",
+    page: int = 1,
+    use_premium: Optional[bool] = None,
+) -> Tuple[str, InlineKeyboardMarkup]:
+    premium = _is_premium_emojis_enabled(use_premium)
+    if filter_mode not in ("5m", "15m", "1h", "all"):
         filter_mode = "all"
 
     events = _filter_live_events(filter_mode)
@@ -3083,74 +3322,140 @@ def build_live_receivers_summary_view(filter_mode: str = "all", page: int = 1) -
     total_users = len(grouped)
     total_otps = len(events)
 
-    per_page = 10
+    per_page = 25
     total_pages = max(1, (total_users + per_page - 1) // per_page)
     page = max(1, min(page, total_pages))
     start_idx = (page - 1) * per_page
     page_items = grouped[start_idx:start_idx + per_page]
 
-    filter_labels = {"all": "All Recent", "15m": "Last 15m", "1h": "Last 1h"}
+    filter_labels = {
+        "5m": "Last 5m",
+        "15m": "Last 15m",
+        "1h": "Last 1h",
+        "all": "All Recent",
+    }
     now_bd = datetime.datetime.now(_BD_TZ).strftime("%H:%M:%S")
 
+    e_group = _tg_emoji("6307589808424228455", "👥", premium)
+    e_search = _tg_emoji("5352922460897452503", "🔍", premium)
+    e_msg = _tg_emoji("5472239203590888751", "📨", premium)
+    e_clock = _tg_emoji("5472239203590888751", "⏱️", premium)
+    e_user = _tg_emoji("6307589808424228455", "👤", premium)
+
     text = (
-        f"👥 <b>ACTIVE LIVE RECEIVERS SUMMARY</b>\n"
+        f"{e_group} <b>ACTIVE LIVE RECEIVERS SUMMARY</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔍 Filter: <b>{filter_labels[filter_mode]}</b>  •  "
-        f"👥 Users: <code>{total_users}</code>  •  "
-        f"📨 OTPs: <code>{total_otps}</code>\n"
-        f"🕒 Updated: <code>{now_bd}</code>  •  Page <code>{page}/{total_pages}</code>\n"
+        f"{e_search} {filter_labels[filter_mode]} • "
+        f"{e_group} {total_users} • "
+        f"{e_msg} {total_otps}\n"
+        f"{e_clock} {now_bd} • Page {page}/{total_pages}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
     )
 
     if not page_items:
         text += "\n<i>No active receivers found for this time window.</i>\n"
     else:
+        plain_len = len(re.sub(r'<[^>]+>', '', text))
         for idx, rec in enumerate(page_items, start=start_idx + 1):
             uid = rec["user_id"]
-            user_link = f'<a href="tg://user?id={uid}">{html.escape(rec["first_name"])}</a>'
-            uname_part = f" (@{html.escape(rec['username'])})" if rec["username"] else ""
-            service = safe_html_escape(rec["last_service"])
-            country = html.escape(strip_all_emojis(rec["last_country"]) or str(rec["last_country"]))
+            fname = _truncate_text(rec["first_name"], 24)
+            user_link = f'<a href="tg://user?id={uid}">{html.escape(fname)}</a>'
+            uname_part = f" (@{html.escape(_truncate_text(rec['username'], 24))})" if rec["username"] else ""
+            service = _format_live_service(rec["last_service"], premium)
+            raw_country = strip_all_emojis(rec["last_country"]) or str(rec["last_country"])
+            country = html.escape(_truncate_text(raw_country, 16))
             number = html.escape(str(rec["last_number"]))
             rel_time = _format_relative_time(rec["last_ts"])
 
-            text += (
-                f"\n<b>{idx}.</b> {user_link}{uname_part} • <code>{uid}</code> — <b>{rec['count']} OTP(s)</b>\n"
-                f"   └ Last: {service} • {country} • <code>{number}</code> ({rel_time})\n"
+            entry = (
+                f"\n{idx}. {e_user} {user_link}{uname_part} — <b>{rec['count']} OTP</b>\n"
+                f"    - {country} {service} • {number} ({rel_time})\n"
             )
+            entry_plain_len = len(re.sub(r'<[^>]+>', '', entry))
+            if plain_len + entry_plain_len > 3950:
+                text += "\n<i>…trimmed to fit Telegram message limit.</i>\n"
+                break
+            text += entry
+            plain_len += entry_plain_len
 
-    buttons = [
-        [
-            create_button("All" if filter_mode != "all" else "• All •", callback_data="adm:live:summary:all:1", style="success" if filter_mode == "all" else "primary"),
-            create_button("15m" if filter_mode != "15m" else "• 15m •", callback_data="adm:live:summary:15m:1", style="success" if filter_mode == "15m" else "primary"),
-            create_button("1h" if filter_mode != "1h" else "• 1h •", callback_data="adm:live:summary:1h:1", style="success" if filter_mode == "1h" else "primary"),
-        ]
-    ]
+    filter_row = []
+    for mode, lbl in (("5m", "5m"), ("15m", "15m"), ("1h", "1h"), ("all", "All")):
+        is_active = (filter_mode == mode)
+        btn_text = f"• {lbl} •" if is_active else lbl
+        filter_row.append(_admin_inline_btn(
+            btn_text,
+            callback_data=f"adm:live:summary:{mode}:1",
+            style="success" if is_active else "primary",
+            emoji_id="5472239203590888751" if mode != "all" else "5352922460897452503",
+            fallback_emoji="⏱️" if mode != "all" else "🔍",
+            use_premium=premium,
+        ))
+
+    buttons = [filter_row]
 
     if total_pages > 1:
         nav_row = []
         if page > 1:
-            nav_row.append(create_button("◀️ Prev", callback_data=f"adm:live:summary:{filter_mode}:{page - 1}", style="primary"))
+            nav_row.append(_admin_inline_btn(
+                "Prev",
+                callback_data=f"adm:live:summary:{filter_mode}:{page - 1}",
+                style="primary",
+                emoji_id="5456187398977247949",
+                fallback_emoji="◀️",
+                use_premium=premium,
+            ))
         nav_row.append(create_button(f"{page}/{total_pages}", callback_data="noop", style="primary"))
         if page < total_pages:
-            nav_row.append(create_button("Next ▶️", callback_data=f"adm:live:summary:{filter_mode}:{page + 1}", style="primary"))
+            nav_row.append(_admin_inline_btn(
+                "Next",
+                callback_data=f"adm:live:summary:{filter_mode}:{page + 1}",
+                style="primary",
+                emoji_id="5370604433233177619",
+                fallback_emoji="▶️",
+                use_premium=premium,
+                emoji_after=True,
+            ))
         buttons.append(nav_row)
 
     buttons.append([
-        create_button("🔄 Refresh", callback_data=f"adm:live:summary:{filter_mode}:{page}", style="success"),
-        create_button("📡 Live Stream", callback_data=f"adm:live:page:{filter_mode}:1", style="primary"),
+        _admin_inline_btn(
+            "Refresh",
+            callback_data=f"adm:live:summary:{filter_mode}:{page}",
+            style="success",
+            emoji_id="5244758760429213978",
+            fallback_emoji="🔄",
+            use_premium=premium,
+        ),
+        _admin_inline_btn(
+            "Live Stream",
+            callback_data=f"adm:live:page:{filter_mode}:1",
+            style="primary",
+            emoji_id="5352877703043258544",
+            fallback_emoji="📡",
+            use_premium=premium,
+        ),
     ])
-    buttons.append([create_button("Back to Panel", callback_data="adm:panel_back", style="danger", icon_custom_emoji_id="5456187398977247949")])
+    buttons.append([
+        _admin_inline_btn(
+            "Back to Panel",
+            callback_data="adm:panel_back",
+            style="danger",
+            emoji_id="5456187398977247949",
+            fallback_emoji="◀️",
+            use_premium=premium,
+        )
+    ])
     return text, InlineKeyboardMarkup(buttons)
 
 
-def build_user_manager_view():
-    text = "👥 **USER MANAGER**\n\nManage users, search for specific user details, view global statistics, or export the entire database."
+def build_user_manager_view(use_premium: Optional[bool] = None):
+    text = "👥 **USER MANAGER**\n\nManage users, control admins, search for specific user details, view global statistics, or export the database."
     buttons = [
-        [create_button("Search User", callback_data="adm:usr:search", style="primary", icon_custom_emoji_id="6307589808424228455")],
-        [create_button("Statistics", callback_data="adm:usr:stats", style="primary", icon_custom_emoji_id="5352877703043258544")],
-        [create_button("Export Users (JSON)", callback_data="adm:usr:export", style="success", icon_custom_emoji_id="6039573425268201570")],
-        [create_button("Back to Panel", callback_data="adm:panel_back", style="danger", icon_custom_emoji_id="5456187398977247949")]
+        [_admin_inline_btn("Search User", callback_data="adm:usr:search", style="primary", emoji_id="6307589808424228455", fallback_emoji="🔍", use_premium=use_premium)],
+        [_admin_inline_btn("Admin Control", callback_data="adm:ctrl:list", style="primary", emoji_id="5258508428212445001", fallback_emoji="🛡️", use_premium=use_premium)],
+        [_admin_inline_btn("Statistics", callback_data="adm:usr:stats", style="primary", emoji_id="5352877703043258544", fallback_emoji="📊", use_premium=use_premium)],
+        [_admin_inline_btn("Export Users (JSON)", callback_data="adm:usr:export", style="success", emoji_id="6039573425268201570", fallback_emoji="📤", use_premium=use_premium)],
+        [_admin_inline_btn("Back to Panel", callback_data="adm:panel_back", style="danger", emoji_id="5456187398977247949", fallback_emoji="◀️", use_premium=use_premium)]
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -3866,14 +4171,44 @@ def get_main_keyboard(user_id: int):
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
-def get_admin_keyboard():
-    buttons = [
-        [KeyboardButton("Services", icon_custom_emoji_id="5258096772776991776", style="success"), KeyboardButton("Broadcast", icon_custom_emoji_id="5800920921766104807", style="success")],
-        [KeyboardButton("Admin Control", icon_custom_emoji_id="5258508428212445001", style="primary"), KeyboardButton("Global Settings", icon_custom_emoji_id="5258096772776991776", style="primary")],
-        [KeyboardButton("User Manager", icon_custom_emoji_id="6307589808424228455", style="primary"), KeyboardButton("Manage Payouts", icon_custom_emoji_id="5417924076503062111", style="primary")],
-        [KeyboardButton("Live Receivers", icon_custom_emoji_id="5352877703043258544", style="success")],
-        [KeyboardButton("Back", icon_custom_emoji_id="5456187398977247949", style="danger")]
-    ]
+def get_admin_keyboard(use_premium: Optional[bool] = None):
+    premium = _is_premium_emojis_enabled(use_premium)
+    if premium:
+        buttons = [
+            [
+                KeyboardButton("Services", icon_custom_emoji_id="5258096772776991776", style="success"),
+                KeyboardButton("Broadcast", icon_custom_emoji_id="5800920921766104807", style="success"),
+            ],
+            [
+                KeyboardButton("User Manager", icon_custom_emoji_id="6307589808424228455", style="primary"),
+                KeyboardButton("Manage Payouts", icon_custom_emoji_id="5417924076503062111", style="primary"),
+            ],
+            [
+                KeyboardButton("Live Receivers", icon_custom_emoji_id="5352877703043258544", style="success"),
+                KeyboardButton("Global Settings", icon_custom_emoji_id="5258096772776991776", style="primary"),
+            ],
+            [
+                KeyboardButton("Back", icon_custom_emoji_id="5456187398977247949", style="danger"),
+            ],
+        ]
+    else:
+        buttons = [
+            [
+                KeyboardButton("🏷️ Services", style="success"),
+                KeyboardButton("📢 Broadcast", style="success"),
+            ],
+            [
+                KeyboardButton("👥 User Manager", style="primary"),
+                KeyboardButton("💰 Manage Payouts", style="primary"),
+            ],
+            [
+                KeyboardButton("📡 Live Receivers", style="success"),
+                KeyboardButton("⚙️ Global Settings", style="primary"),
+            ],
+            [
+                KeyboardButton("◀️ Back", style="danger"),
+            ],
+        ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def get_global_settings_keyboard():
@@ -3946,7 +4281,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.effective_user.username or ""
     await run_db(save_user, user_id, first_name, username)
 
-    text_upper = text.strip().upper()
+    text_upper = _clean_menu_text(text).upper()
     user_is_admin = is_admin_sync(user_id)
 
     if not user_is_admin and text_upper in ("GET NUMBER",):
@@ -4031,11 +4366,15 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text_upper == "ADMIN PANEL" and user_is_admin:
         context.user_data['current_menu'] = 'admin'
         total_users = len(await run_db(get_all_users))
-        await update.message.reply_text(
+        panel_text = (
             f"**ADMIN PANEL**\n\n"
             f"⚙️ DB Mode: **{CURRENT_DB_MODE}**\n"
-            f"👥 Total Registered Users: `{total_users}`",
-            reply_markup=get_admin_keyboard(), parse_mode="Markdown"
+            f"👥 Total Registered Users: `{total_users}`"
+        )
+        await _reply_with_emoji_fallback(
+            update.message,
+            lambda prem: (panel_text, get_admin_keyboard(use_premium=prem)),
+            parse_mode="Markdown",
         )
 
     elif (text_upper == "MANAGE PAYOUTS" or text_upper == "WITHDRAW") and user_is_admin:
@@ -4050,14 +4389,18 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text_upper == "USER MANAGER" and user_is_admin:
         context.user_data['current_menu'] = 'admin'
-        text_msg, kbd = build_user_manager_view()
-        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+        await _reply_with_emoji_fallback(
+            update.message,
+            lambda prem: build_user_manager_view(use_premium=prem),
+            parse_mode="Markdown",
+        )
 
     elif text_upper == "LIVE RECEIVERS" and user_is_admin:
         context.user_data['current_menu'] = 'admin'
-        text_msg, kbd = build_live_receivers_view("all", 1)
-        await update.message.reply_text(
-            text_msg, reply_markup=kbd, parse_mode="HTML",
+        await _reply_with_emoji_fallback(
+            update.message,
+            lambda prem: build_live_receivers_view("all", 1, use_premium=prem),
+            parse_mode="HTML",
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
 
@@ -4090,19 +4433,27 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text_upper == "ADMIN CONTROL" and user_is_admin:
         context.user_data['current_menu'] = 'admin'
-        text_msg, kbd = await run_db(build_admin_control_view)
-        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+        await run_db(get_all_admins_sync)
+        await _reply_with_emoji_fallback(
+            update.message,
+            lambda prem: build_admin_control_view(use_premium=prem),
+            parse_mode="Markdown",
+        )
 
     elif text_upper == "BACK":
         curr_menu = context.user_data.get('current_menu', 'main')
         if curr_menu == 'global_settings' and user_is_admin:
             context.user_data['current_menu'] = 'admin'
             total_users = len(await run_db(get_all_users))
-            await update.message.reply_text(
+            panel_text = (
                 f"**ADMIN PANEL**\n\n"
                 f"⚙️ DB Mode: **{CURRENT_DB_MODE}**\n"
-                f"👥 Total Registered Users: `{total_users}`",
-                reply_markup=get_admin_keyboard(), parse_mode="Markdown"
+                f"👥 Total Registered Users: `{total_users}`"
+            )
+            await _reply_with_emoji_fallback(
+                update.message,
+                lambda prem: (panel_text, get_admin_keyboard(use_premium=prem)),
+                parse_mode="Markdown",
             )
         else:
             context.user_data['current_menu'] = 'main'
@@ -5673,9 +6024,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user_is_admin: await query.answer(); return
         await query.answer()
         total_users = len(await run_db(get_all_users))
-        await query.message.reply_text(
-            f"**ADMIN PANEL**\n\n⚙️ DB Mode: **{CURRENT_DB_MODE}**\n👥 Total Users: `{total_users}`",
-            reply_markup=get_admin_keyboard(), parse_mode="Markdown"
+        panel_text = f"**ADMIN PANEL**\n\n⚙️ DB Mode: **{CURRENT_DB_MODE}**\n👥 Total Users: `{total_users}`"
+        await _reply_with_emoji_fallback(
+            query.message,
+            lambda prem: (panel_text, get_admin_keyboard(use_premium=prem)),
+            parse_mode="Markdown",
         )
 
     elif data.startswith("adm:live:page:"):
@@ -5686,18 +6039,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page = int(parts[4]) if len(parts) > 4 else 1
         except ValueError:
             page = 1
-        text_msg, kbd = build_live_receivers_view(filter_mode, page)
         try:
-            await query.edit_message_text(
-                text_msg, reply_markup=kbd, parse_mode="HTML",
+            status = await _edit_with_emoji_fallback(
+                query,
+                lambda prem: build_live_receivers_view(filter_mode, page, use_premium=prem),
+                parse_mode="HTML",
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
-            await query.answer("Updated!")
+            await query.answer("Already up to date!" if status == "not_modified" else "Updated!")
         except Exception as e:
-            if "not modified" in str(e).lower():
-                await query.answer("Already up to date!")
-            else:
-                await query.answer()
+            logger.warning(f"adm:live:page error: {e}")
+            await query.answer()
 
     elif data.startswith("adm:live:summary:"):
         if not user_is_admin: await query.answer(); return
@@ -5707,24 +6059,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page = int(parts[4]) if len(parts) > 4 else 1
         except ValueError:
             page = 1
-        text_msg, kbd = build_live_receivers_summary_view(filter_mode, page)
         try:
-            await query.edit_message_text(
-                text_msg, reply_markup=kbd, parse_mode="HTML",
+            status = await _edit_with_emoji_fallback(
+                query,
+                lambda prem: build_live_receivers_summary_view(filter_mode, page, use_premium=prem),
+                parse_mode="HTML",
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
-            await query.answer("Updated!")
+            await query.answer("Already up to date!" if status == "not_modified" else "Updated!")
         except Exception as e:
-            if "not modified" in str(e).lower():
-                await query.answer("Already up to date!")
-            else:
-                await query.answer()
+            logger.warning(f"adm:live:summary error: {e}")
+            await query.answer()
 
     elif data == "adm:usr:manager":
         if not user_is_admin: await query.answer(); return
         await query.answer()
-        text_msg, kbd = build_user_manager_view()
-        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: build_user_manager_view(use_premium=prem),
+            parse_mode="Markdown",
+        )
 
     elif data == "adm:usr:stats":
         if not user_is_admin: await query.answer(); return
@@ -5750,8 +6104,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             document=file_obj,
             caption=f"✅ Exported {len(users)} users successfully!"
         )
-        text_msg, kbd = build_user_manager_view()
-        await query.edit_message_text("✅ Export completed. Check the file sent above.", reply_markup=kbd, parse_mode="Markdown")
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: ("✅ Export completed. Check the file sent above.", build_user_manager_view(use_premium=prem)[1]),
+            parse_mode="Markdown",
+        )
 
     elif data.startswith("adm:usr:ban:") or data.startswith("adm:usr:unban:"):
         if not user_is_admin: await query.answer(); return
@@ -5884,8 +6241,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "adm:ctrl:list":
         if not user_is_admin: await query.answer(); return
         await query.answer()
-        text_msg, kbd = build_admin_control_view()
-        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: build_admin_control_view(use_premium=prem),
+            parse_mode="Markdown",
+        )
 
     elif data.startswith("adm:delconf:"):
         if not user_is_admin: await query.answer(); return
@@ -5900,11 +6260,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"⚠️ **CONFIRMATION**\n\nRemove admin **{escape_md(target_name)}** (`{target_uid}`)?"
         )
-        kbd = InlineKeyboardMarkup([
-            [create_button("YES, REMOVE", callback_data=f"adm:del:{target_uid}", style="danger", icon_custom_emoji_id="5424998570539373838"),
-             create_button("CANCEL", callback_data="adm:ctrl:list", style="primary", icon_custom_emoji_id="5456187398977247949")]
-        ])
-        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: (
+                text,
+                InlineKeyboardMarkup([[
+                    _admin_inline_btn("YES, REMOVE", callback_data=f"adm:del:{target_uid}", style="danger", emoji_id="5424998570539373838", fallback_emoji="✅", use_premium=prem),
+                    _admin_inline_btn("CANCEL", callback_data="adm:ctrl:list", style="primary", emoji_id="5456187398977247949", fallback_emoji="◀️", use_premium=prem),
+                ]]),
+            ),
+            parse_mode="Markdown",
+        )
 
     elif data.startswith("adm:del:"):
         if not user_is_admin: await query.answer(); return
@@ -5914,8 +6280,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         success = await run_db(delete_admin_sync, target_uid)
         await query.answer("Removed!" if success else "Failed.", show_alert=True)
-        text_msg, kbd = build_admin_control_view()
-        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: build_admin_control_view(use_premium=prem),
+            parse_mode="Markdown",
+        )
 
     elif data.startswith("adm:setqty:"):
         if not user_is_admin: await query.answer(); return
