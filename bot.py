@@ -1087,6 +1087,10 @@ async def _process_hybrid_item(panel_id: str, item: dict, context_holder: dict, 
     if queue:
         await queue.put(final_item)
 
+    event = context_holder.get("ws_event")
+    if event:
+        event.set()
+
 def _augestel_ws_listener(ws, panel_id: str):
     """Listens to live-sms websocket payload (Synchronous callback for Playwright)"""
     # 👈 এখানে সব ওয়েবসকেট URL দেখতে পাবেন
@@ -1285,8 +1289,10 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
         
         # Queue for unified processing
         otp_queue = asyncio.Queue()
+        ws_event = asyncio.Event()
         state = {
             "queue": otp_queue,
+            "ws_event": ws_event,
             "raw_items_queue": otp_queue
         }
         
@@ -6603,6 +6609,9 @@ async def poll_single_panel(panel_id: str, application: Application,
                 await asyncio.sleep(interval)
                 continue
 
+            # ==========================================
+            # 👇 AUGESTEL PANEL LOGIC (এখানে পরিবর্তন করা হয়েছে)
+            # ==========================================
             if get_panel_type(panel) == "augestel":
                 try:
                     cfg = json.loads(panel.get("mapping_json") or "{}")
@@ -6616,6 +6625,7 @@ async def poll_single_panel(panel_id: str, application: Application,
                         logger.info(f"Augestel panel {panel_id}: {status}")
                         await asyncio.sleep(30)
                         continue
+                        
                 items, status = await fetch_augestel_panel_data(panel_id, cfg)
                 AUGESTEL_PANEL_STATUS[panel_id] = status
                 status_lower = status.lower()
@@ -6627,11 +6637,12 @@ async def poll_single_panel(panel_id: str, application: Application,
                     logger.info(f"Augestel panel {panel_id}: {status} - forcing re-login")
                     await asyncio.sleep(3)
                     continue
+                    
                 if items:
                     new_items, new_ids = _filter_new_items(items, processed_ids)
                     if new_items:
                         sources = ", ".join(set(i.get("source", "Unknown") for i in new_items))
-                        logger.info(f"Augestel Panel {panel_id}: {len(new_items)} new items - delivering")
+                        logger.info(f"Augestel Panel {panel_id}: {len(new_items)} new items - delivering (Source: {sources})")
                         try:
                             await run_db(mark_otp_seen_batch_sync, new_ids)
                         except Exception as e:
@@ -6645,8 +6656,26 @@ async def poll_single_panel(panel_id: str, application: Application,
                                 except Exception as e:
                                     logger.exception(f"process_otp_items_fast CRASHED: {e}")
                             asyncio.create_task(_safe_process_aug(new_items, application))
-                await asyncio.sleep(interval)
+                
+                # 👇 WebSocket ইভেন্টের জন্য অপেক্ষা করার নতুন লজিক
+                ws_ev = sess.get("state", {}).get("ws_event")
+                if ws_ev:
+                    try:
+                        # interval (১৩ সেকেন্ড) পর্যন্ত অপেক্ষা করবে। 
+                        # কিন্তু WebSocket থেকে ডাটা আসার সাথে সাথে ws_ev.set() হওয়ায় এটি সাথে সাথে জেগে উঠবে।
+                        await asyncio.wait_for(ws_ev.wait(), timeout=interval)
+                    except asyncio.TimeoutError:
+                        # ১৩ সেকেন্ড শেষ, নতুন কোনো OTP আসেনি, তাই API চেক করার জন্য লুপটি আবার ঘুরবে
+                        pass
+                    finally:
+                        ws_ev.clear() # পরের OTP এর জন্য ইভেন্ট রিসেট করা হলো
+                else:
+                    # সেফটি ফলব্যাক (যদি কোনোভাবে ws_event না থাকে)
+                    await asyncio.sleep(interval)
                 continue
+            # ==========================================
+            # 👆 AUGESTEL PANEL LOGIC ENDS
+            # ==========================================
 
             mapping = None
             mapping_json = panel.get("mapping_json") or ""
@@ -6728,7 +6757,6 @@ async def poll_single_panel(panel_id: str, application: Application,
 
             sleep_t = interval * min(8, 2 ** min(error_streak, 3)) if error_streak else interval
             await asyncio.sleep(sleep_t)
-
 
 async def otp_poller_manager(application: Application):
     loaded = await run_db(load_seen_otp_ids_sync) or {}
