@@ -6330,6 +6330,33 @@ async def process_otp_items_fast(items: list, application: Application):
     if not items:
         return
 
+    # ═══════════════════════════════════════════════════════════
+    # ⚡ OPT 1: Start allocation lookup IMMEDIATELY (background task)
+    # ═══════════════════════════════════════════════════════════
+    numbers = [str(it.get("num", "")).strip() for it in items]
+    clean_numbers = [re.sub(r'\D', '', n) for n in numbers]
+    combined = list(set(numbers + clean_numbers))
+
+    def _fetch_allocations_sync():
+        result_map = {}
+        try:
+            for i in range(0, len(combined), 200):
+                chunk = combined[i:i+200]
+                rows = supabase.table("allocations").select(
+                    "number, user_id, service, country"
+                ).in_("number", chunk).execute().data or []
+                for r in rows:
+                    result_map[r["number"]] = r
+        except Exception as e:
+            logger.error(f"batch alloc lookup error: {e}")
+        return result_map
+
+    alloc_task = asyncio.create_task(run_db(_fetch_allocations_sync))
+
+    # ═══════════════════════════════════════════════════════════
+    # ⚡ OPT 2: Pre-load cached settings WHILE allocation runs
+    # (These are nearly instant - cache hits)
+    # ═══════════════════════════════════════════════════════════
     bot_username, bot_link = await _get_bot_info(application)
 
     ch_link = clean_tg_link(get_setting("channel", "https://t.me/your_channel"))
@@ -6341,27 +6368,12 @@ async def process_otp_items_fast(items: list, application: Application):
     otp_format = get_setting("otp_group_format", "regular")
     premium_mode = (otp_format == "premium")
 
-    numbers = [str(it.get("num", "")).strip() for it in items]
-    clean_numbers = [re.sub(r'\D', '', n) for n in numbers]
-    combined = list(set(numbers + clean_numbers))
+    # ═══════════════════════════════════════════════════════════
+    # ⚡ OPT 3: Await allocation result
+    # ═══════════════════════════════════════════════════════════
+    alloc_map = await alloc_task
 
-    alloc_map: Dict[str, dict] = {}
-    try:
-        chunks = [combined[i:i+200] for i in range(0, len(combined), 200)]
-
-        def _fetch_chunk(chunk):
-            return supabase.table("allocations").select(
-                "number, user_id, service, country"
-            ).in_("number", chunk).execute().data or []
-
-        results = await asyncio.gather(*[run_db(_fetch_chunk, c) for c in chunks], return_exceptions=True)
-        for res in results:
-            if isinstance(res, list):
-                for r in res:
-                    alloc_map[r["number"]] = r
-    except Exception as e:
-        logger.error(f"batch alloc lookup error: {e}")
-
+    # Group items by user
     per_user: Dict[int, dict] = {}
     service_country_pairs = set()
     for it in items:
@@ -6380,16 +6392,38 @@ async def process_otp_items_fast(items: list, application: Application):
     if not per_user:
         return
 
+    # ═══════════════════════════════════════════════════════════
+    # ⚡ OPT 4: Fetch missing payouts + user profiles IN PARALLEL
+    # (single gather, runs concurrently)
+    # ═══════════════════════════════════════════════════════════
     missing_pairs = [
         (s, c) for (s, c) in service_country_pairs
         if s not in PAYOUTS_CACHE or c not in PAYOUTS_CACHE.get(s, {})
     ]
-    if missing_pairs:
-        await asyncio.gather(
-            *[run_db(get_payout_sync, s, c) for (s, c) in missing_pairs],
-            return_exceptions=True
-        )
 
+    async def _fetch_profile(uid: int):
+        try:
+            prof = await run_db(get_user_profile_sync, uid)
+            return (uid, prof)
+        except Exception:
+            return (uid, {"balance": 0.0, "total_otps": 0})
+
+    parallel_tasks = []
+    if missing_pairs:
+        parallel_tasks.extend([run_db(get_payout_sync, s, c) for (s, c) in missing_pairs])
+    parallel_tasks.extend([_fetch_profile(uid) for uid in per_user.keys()])
+
+    results = await asyncio.gather(*parallel_tasks, return_exceptions=True)
+
+    old_profiles: Dict[int, dict] = {}
+    offset = len(missing_pairs) if missing_pairs else 0
+    for r in results[offset:]:
+        if isinstance(r, tuple) and len(r) == 2 and isinstance(r[0], int):
+            old_profiles[r[0]] = r[1]
+
+    # ═══════════════════════════════════════════════════════════
+    # ⚡ OPT 5: Calculate per-item payouts + optimistic balances
+    # ═══════════════════════════════════════════════════════════
     item_payout_map: Dict[int, list] = {}
     for u, data in per_user.items():
         lst = []
@@ -6399,15 +6433,38 @@ async def process_otp_items_fast(items: list, application: Application):
             lst.append((it, alloc, p))
         item_payout_map[u] = lst
 
+    # Local optimistic balances (real DB update happens in background below)
+    display_profiles: Dict[int, dict] = {}
+    for u, data in per_user.items():
+        old = old_profiles.get(u) or {"balance": 0.0, "total_otps": 0}
+        display_profiles[u] = {
+            "balance": old["balance"] + data["amount"],
+            "total_otps": old["total_otps"] + data["count"],
+        }
+
+    # ═══════════════════════════════════════════════════════════
+    # ⚡ OPT 6: FIRE-AND-FORGET earnings DB update
+    # (runs WHILE we're building and sending Telegram messages)
+    # ═══════════════════════════════════════════════════════════
     batch_updates = [
         {"user_id": u, "amount": d["amount"], "count": d["count"]}
         for u, d in per_user.items()
     ]
-    profiles = await run_db(add_otp_earnings_batch_sync, batch_updates) or {}
 
+    async def _bg_update_earnings():
+        try:
+            await run_db(add_otp_earnings_batch_sync, batch_updates)
+        except Exception as e:
+            logger.error(f"bg earnings update failed: {e}")
+
+    asyncio.create_task(_bg_update_earnings())
+
+    # ═══════════════════════════════════════════════════════════
+    # ⚡ Build and send all messages IN PARALLEL
+    # ═══════════════════════════════════════════════════════════
     send_tasks = []
     for u, data in per_user.items():
-        prof = profiles.get(u) or {"balance": 0.0, "total_otps": 0}
+        prof = display_profiles.get(u) or {"balance": 0.0, "total_otps": 0}
         bal_str = fmt_num(prof["balance"])
 
         for item, alloc, item_payout in item_payout_map[u]:
@@ -6427,10 +6484,10 @@ async def process_otp_items_fast(items: list, application: Application):
             safe_masked_num = html.escape(mask_number_aph(num))
             payout_str = fmt_num(item_payout)
 
-            # 🆕 CLI Emoji Lookup
+            # CLI Emoji Lookup
             clean_name = re.sub(r'<tg-emoji.*?>.*?</tg-emoji>', '', display_service)
             cli_clean = remove_emojis(clean_name).strip().lower()
-            
+
             cli_emoji_id = get_setting(f"cli_emoji:{cli_clean}", "")
             cli_emoji_html = (
                 f'<tg-emoji emoji-id="{cli_emoji_id}">🎲</tg-emoji>'
@@ -6541,6 +6598,16 @@ async def poll_single_panel(panel_id: str, application: Application,
     ) as client:
         error_streak = 0
         consecutive_log_skips = 0
+
+        # 🚀 Helper: DB-তে seen mark করা ব্যাকগ্রাউন্ডে করি (ডেলিভারি ডিলে এড়াতে)
+        async def _bg_mark_seen(mids: list):
+            try:
+                await run_db(mark_otp_seen_batch_sync, mids)
+            except Exception as e:
+                for mid in mids:
+                    processed_ids.pop(mid, None)
+                logger.error(f"bg mark_otp_seen failed, rolled back {len(mids)}: {e}")
+
         while True:
             panel = await run_db(_get_panel_cached_sync, panel_id)
             if not panel:
@@ -6592,25 +6659,21 @@ async def poll_single_panel(panel_id: str, application: Application,
                     new_items, new_ids = _filter_new_items(items, processed_ids)
                     if new_items:
                         logger.info(f"Captcha Panel {panel_id}: {len(new_items)} new items → delivering")
-                        try:
-                            await run_db(mark_otp_seen_batch_sync, new_ids)
-                        except Exception as e:
-                            for mid in new_ids:
-                                processed_ids.pop(mid, None)
-                            logger.error(f"mark_otp_seen failed, rolled back {len(new_ids)}: {e}")
-                        else:
-                            async def _safe_process_cpt(it, app):
-                                try:
-                                    await process_otp_items_fast(it, app)
-                                except Exception as e:
-                                    logger.exception(f"process_otp_items_fast CRASHED: {e}")
-                            asyncio.create_task(_safe_process_cpt(new_items, application))
+                        # ⚡ Fire-and-forget: DB mark ব্যাকগ্রাউন্ডে
+                        asyncio.create_task(_bg_mark_seen(new_ids))
+
+                        async def _safe_process_cpt(it, app):
+                            try:
+                                await process_otp_items_fast(it, app)
+                            except Exception as e:
+                                logger.exception(f"process_otp_items_fast CRASHED: {e}")
+                        asyncio.create_task(_safe_process_cpt(new_items, application))
 
                 await asyncio.sleep(interval)
                 continue
 
             # ==========================================
-            # 👇 AUGESTEL PANEL LOGIC (এখানে পরিবর্তন করা হয়েছে)
+            # 👇 AUGESTEL PANEL LOGIC
             # ==========================================
             if get_panel_type(panel) == "augestel":
                 try:
@@ -6625,7 +6688,7 @@ async def poll_single_panel(panel_id: str, application: Application,
                         logger.info(f"Augestel panel {panel_id}: {status}")
                         await asyncio.sleep(30)
                         continue
-                        
+
                 items, status = await fetch_augestel_panel_data(panel_id, cfg)
                 AUGESTEL_PANEL_STATUS[panel_id] = status
                 status_lower = status.lower()
@@ -6637,40 +6700,32 @@ async def poll_single_panel(panel_id: str, application: Application,
                     logger.info(f"Augestel panel {panel_id}: {status} - forcing re-login")
                     await asyncio.sleep(3)
                     continue
-                    
+
                 if items:
                     new_items, new_ids = _filter_new_items(items, processed_ids)
                     if new_items:
                         sources = ", ".join(set(i.get("source", "Unknown") for i in new_items))
                         logger.info(f"Augestel Panel {panel_id}: {len(new_items)} new items - delivering (Source: {sources})")
-                        try:
-                            await run_db(mark_otp_seen_batch_sync, new_ids)
-                        except Exception as e:
-                            for mid in new_ids:
-                                processed_ids.pop(mid, None)
-                            logger.error(f"mark_otp_seen failed, rolled back {len(new_ids)}: {e}")
-                        else:
-                            async def _safe_process_aug(it, app):
-                                try:
-                                    await process_otp_items_fast(it, app)
-                                except Exception as e:
-                                    logger.exception(f"process_otp_items_fast CRASHED: {e}")
-                            asyncio.create_task(_safe_process_aug(new_items, application))
-                
-                # 👇 WebSocket ইভেন্টের জন্য অপেক্ষা করার নতুন লজিক
+                        # ⚡ Fire-and-forget: DB mark ব্যাকগ্রাউন্ডে
+                        asyncio.create_task(_bg_mark_seen(new_ids))
+
+                        async def _safe_process_aug(it, app):
+                            try:
+                                await process_otp_items_fast(it, app)
+                            except Exception as e:
+                                logger.exception(f"process_otp_items_fast CRASHED: {e}")
+                        asyncio.create_task(_safe_process_aug(new_items, application))
+
+                # 👇 WebSocket ইভেন্টের জন্য অপেক্ষা
                 ws_ev = sess.get("state", {}).get("ws_event")
                 if ws_ev:
                     try:
-                        # interval (১৩ সেকেন্ড) পর্যন্ত অপেক্ষা করবে। 
-                        # কিন্তু WebSocket থেকে ডাটা আসার সাথে সাথে ws_ev.set() হওয়ায় এটি সাথে সাথে জেগে উঠবে।
                         await asyncio.wait_for(ws_ev.wait(), timeout=interval)
                     except asyncio.TimeoutError:
-                        # ১৩ সেকেন্ড শেষ, নতুন কোনো OTP আসেনি, তাই API চেক করার জন্য লুপটি আবার ঘুরবে
                         pass
                     finally:
-                        ws_ev.clear() # পরের OTP এর জন্য ইভেন্ট রিসেট করা হলো
+                        ws_ev.clear()
                 else:
-                    # সেফটি ফলব্যাক (যদি কোনোভাবে ws_event না থাকে)
                     await asyncio.sleep(interval)
                 continue
             # ==========================================
@@ -6722,19 +6777,15 @@ async def poll_single_panel(panel_id: str, application: Application,
                         new_items, new_ids = _filter_new_items(raw_items, processed_ids)
                         if new_items:
                             logger.info(f"Panel {panel_id}: {len(new_items)} new items → delivering")
-                            try:
-                                await run_db(mark_otp_seen_batch_sync, new_ids)
-                            except Exception as e:
-                                for mid in new_ids:
-                                    processed_ids.pop(mid, None)
-                                logger.error(f"mark_otp_seen failed, rolled back {len(new_ids)}: {e}")
-                            else:
-                                async def _safe_process(items, app):
-                                    try:
-                                        await process_otp_items_fast(items, app)
-                                    except Exception as e:
-                                        logger.exception(f"process_otp_items_fast CRASHED: {e}")
-                                asyncio.create_task(_safe_process(new_items, application))
+                            # ⚡ Fire-and-forget: DB mark ব্যাকগ্রাউন্ডে
+                            asyncio.create_task(_bg_mark_seen(new_ids))
+
+                            async def _safe_process(items, app):
+                                try:
+                                    await process_otp_items_fast(items, app)
+                                except Exception as e:
+                                    logger.exception(f"process_otp_items_fast CRASHED: {e}")
+                            asyncio.create_task(_safe_process(new_items, application))
                     error_streak = 0
                 else:
                     error_streak += 1
@@ -6757,7 +6808,7 @@ async def poll_single_panel(panel_id: str, application: Application,
 
             sleep_t = interval * min(8, 2 ** min(error_streak, 3)) if error_streak else interval
             await asyncio.sleep(sleep_t)
-
+            
 async def otp_poller_manager(application: Application):
     loaded = await run_db(load_seen_otp_ids_sync) or {}
     processed_ids = TimedLRUDict(maxsize=PROCESSED_IDS_MAX, ttl=OTP_ID_RETENTION_SECONDS)
