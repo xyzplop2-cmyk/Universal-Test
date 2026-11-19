@@ -539,7 +539,7 @@ def create_button(text: str, callback_data: str = None, url: str = None,
     if style:
         kwargs["style"] = style
 
-    final_emoji = icon_custom_emoji_id or extracted_id
+    final_emoji = extracted_id or icon_custom_emoji_id
     if final_emoji:
         kwargs["icon_custom_emoji_id"] = final_emoji
 
@@ -2230,6 +2230,26 @@ def set_country_short_sync(service: str, country: str, short: str):
     set_setting(f"country_short:{service}:{country}", short)
 
 
+def is_country_paused_sync(service: str, country: str) -> bool:
+    if not service or not country:
+        return False
+    return str(get_setting(f"country_paused:{service}:{country}", "false")).strip().lower() == "true"
+
+
+def set_country_paused_sync(service: str, country: str, paused: bool):
+    if not service or not country:
+        return
+    set_setting(f"country_paused:{service}:{country}", "true" if paused else "false")
+
+
+def get_active_countries_for_service(service: str) -> list:
+    cnts = SERVICES_CACHE.get(service, {})
+    return [
+        c for c, avail in cnts.items()
+        if avail > 0 and not is_country_paused_sync(service, c)
+    ]
+
+
 # ============================================================
 # 🔒 FORCE JOIN HELPERS
 # ============================================================
@@ -2884,6 +2904,10 @@ def refresh_services_cache_sync():
     except Exception as e:
         logger.error(f"Error populating services cache: {e}")
     SERVICES_CACHE = new_cache
+    for srv, cnts in SERVICES_CACHE.items():
+        for cnt, count in cnts.items():
+            if count <= 0 and not is_country_paused_sync(srv, cnt):
+                set_country_paused_sync(srv, cnt, True)
 
 
 def get_admin_services_summary():
@@ -2914,6 +2938,7 @@ def delete_service_db(service: str):
     for cnt in cnts:
         _delete_setting_key_sync(f"country_short:{service}:{cnt}")
         _delete_setting_key_sync(f"cc_len:{service}:{cnt}")
+        _delete_setting_key_sync(f"country_paused:{service}:{cnt}")
     if firebase_db_ref:
         try:
             firebase_db_ref.reference(f"services/{service}").delete()
@@ -2934,6 +2959,7 @@ def delete_country_db(service: str, country: str):
         logger.error(f"Supabase delete country error: {e}")
     _delete_setting_key_sync(f"country_short:{service}:{country}")
     _delete_setting_key_sync(f"cc_len:{service}:{country}")
+    _delete_setting_key_sync(f"country_paused:{service}:{country}")
     if firebase_db_ref:
         try:
             firebase_db_ref.reference(f"services/{service}/{country}").delete()
@@ -2943,6 +2969,63 @@ def delete_country_db(service: str, country: str):
             logger.error(f"Firebase delete country error: {e}")
     refresh_services_cache_sync()
     refresh_payouts_cache_sync()
+
+
+def clear_country_stock_db(service: str, country: str) -> int:
+    cleared = 0
+    to_delete = []
+    try:
+        num_rows = fetch_all_rows(
+            "numbers", "number",
+            filters={"service": service, "country": country, "status": "available"},
+        )
+        candidates = [str(r["number"]) for r in num_rows if r.get("number")]
+        allocated_set = set()
+        for i in range(0, len(candidates), 500):
+            chunk = candidates[i:i + 500]
+            try:
+                alloc_rows = (
+                    supabase.table("allocations")
+                    .select("number")
+                    .in_("number", chunk)
+                    .execute().data or []
+                )
+                for r in alloc_rows:
+                    allocated_set.add(str(r["number"]))
+            except Exception as e:
+                logger.error(f"clear_country_stock_db alloc check error: {e}")
+
+        to_delete = [n for n in candidates if n not in allocated_set]
+        for i in range(0, len(to_delete), 500):
+            chunk = to_delete[i:i + 500]
+            try:
+                (
+                    supabase.table("numbers")
+                    .delete()
+                    .eq("service", service)
+                    .eq("country", country)
+                    .eq("status", "available")
+                    .in_("number", chunk)
+                    .execute()
+                )
+                cleared += len(chunk)
+            except Exception as e:
+                logger.error(f"clear_country_stock_db delete chunk error: {e}")
+    except Exception as e:
+        logger.error(f"Supabase clear_country_stock_db error: {e}")
+
+    if firebase_db_ref and to_delete:
+        try:
+            for i in range(0, len(to_delete), 500):
+                chunk = to_delete[i:i + 500]
+                firebase_db_ref.reference(f"numbers/{service}/{country}").update({n: None for n in chunk})
+        except Exception as e:
+            logger.warning(f"Firebase clear_country_stock_db error: {e}")
+
+    if service in SERVICES_CACHE and country in SERVICES_CACHE[service]:
+        SERVICES_CACHE[service][country] = 0
+    set_country_paused_sync(service, country, True)
+    return cleared
 
 
 def rename_service_db(old_service: str, new_service: str) -> Tuple[bool, str]:
@@ -2974,6 +3057,10 @@ def rename_service_db(old_service: str, new_service: str) -> Tuple[bool, str]:
         if old_cc_key in SETTINGS_CACHE:
             set_setting(f"cc_len:{new_service}:{cnt}", SETTINGS_CACHE[old_cc_key])
             _delete_setting_key_sync(old_cc_key)
+        old_pause_key = f"country_paused:{old_service}:{cnt}"
+        if old_pause_key in SETTINGS_CACHE:
+            set_setting(f"country_paused:{new_service}:{cnt}", SETTINGS_CACHE[old_pause_key])
+            _delete_setting_key_sync(old_pause_key)
 
     if firebase_db_ref:
         try:
@@ -3018,6 +3105,10 @@ def rename_country_db(service: str, old_country: str, new_country: str) -> Tuple
     if old_cc_key in SETTINGS_CACHE:
         set_setting(f"cc_len:{service}:{new_country}", SETTINGS_CACHE[old_cc_key])
         _delete_setting_key_sync(old_cc_key)
+    old_pause_key = f"country_paused:{service}:{old_country}"
+    if old_pause_key in SETTINGS_CACHE:
+        set_setting(f"country_paused:{service}:{new_country}", SETTINGS_CACHE[old_pause_key])
+        _delete_setting_key_sync(old_pause_key)
 
     if firebase_db_ref:
         try:
@@ -3122,6 +3213,8 @@ def save_numbers_sync(service: str, country: str, numbers: list, payout: float =
         if country not in SERVICES_CACHE[service]:
             SERVICES_CACHE[service][country] = 0
         SERVICES_CACHE[service][country] += inserted
+        if SERVICES_CACHE[service][country] <= 0:
+            set_country_paused_sync(service, country, True)
     except Exception as e:
         logger.warning(f"incremental cache update failed: {e}")
 
@@ -3145,6 +3238,8 @@ def allocate_numbers_sync(service: str, country: str, user_id: int, target_qty: 
 
         if service in SERVICES_CACHE and country in SERVICES_CACHE[service]:
             SERVICES_CACHE[service][country] = max(0, SERVICES_CACHE[service][country] - len(assigned))
+            if SERVICES_CACHE[service][country] <= 0:
+                set_country_paused_sync(service, country, True)
 
         if firebase_db_ref and assigned:
             try:
@@ -3654,16 +3749,16 @@ def build_admin_services_view():
         buttons = [[create_button("Add New Service", callback_data="adm:srv:add", style="success", icon_custom_emoji_id="5287354223141342798")]]
         return text, InlineKeyboardMarkup(buttons)
 
-    text = "📱 <b>SERVICES MANAGEMENT</b>\n\nSummary:"
+    text = "📱 <b>SERVICES MANAGEMENT</b>\n\nSelect a service to manage:"
     buttons = []
     for srv, cnts in summary.items():
-        total_avail = sum(cnts.values())
-        text += f"\n🔹 <b>{safe_html_escape(srv)}</b> (Total Available: <code>{total_avail}</code>)"
-        for cnt, count in cnts.items():
-            payout = get_payout_sync(srv, cnt)
-            text += f"\n   └ {safe_html_escape(cnt)}: <code>{count}</code> avail | payout <code>{fmt_num(payout)}৳</code>"
         srv_tok = _make_srv_token(srv)
-        buttons.append([create_button(srv, callback_data=f"adm:srv:view:{srv_tok}", style="primary", icon_custom_emoji_id="5258096772776991776")])
+        buttons.append([create_button(
+            f"{srv} ({len(cnts)})",
+            callback_data=f"adm:srv:view:{srv_tok}",
+            style="primary",
+            icon_custom_emoji_id="5258096772776991776",
+        )])
 
     buttons.append([create_button("Add New Service / Numbers", callback_data="adm:srv:add", style="success", icon_custom_emoji_id="5287354223141342798")])
     return text, InlineKeyboardMarkup(buttons)
@@ -3672,25 +3767,19 @@ def build_admin_services_view():
 def build_service_manage_view(service: str):
     summary = get_admin_services_summary()
     cnts = summary.get(service, {})
-    total_avail = sum(cnts.values())
     srv_tok = _make_srv_token(service)
 
     text = f"⚙️ <b>SERVICE DETAILS: {safe_html_escape(service)}</b>\n\n"
-    text += f"📊 Total Available Numbers: <code>{total_avail}</code>\n\n"
-    text += "🏳️ <b>Countries, Quantities &amp; Payouts:</b>\n"
-    if cnts:
-        for cnt, count in cnts.items():
-            payout = get_payout_sync(service, cnt)
-            short = get_country_short_sync(service, cnt)
-            text += f"• <b>{safe_html_escape(cnt)}</b> ({safe_html_escape(short)}): <code>{count}</code> avail | <code>{fmt_num(payout)} ৳</code>\n"
-    else:
-        text += "No countries configured.\n"
+    text += "Select a country to manage:" if cnts else "No countries configured yet."
 
     buttons = []
     for cnt, count in cnts.items():
+        payout = get_payout_sync(service, cnt)
+        paused = is_country_paused_sync(service, cnt)
+        paused_badge = " ⏸️" if paused else ""
         sc_tok = _make_sc_token(service, cnt)
         buttons.append([create_button(
-            f"{cnt} ({count})",
+            f"{cnt} ({count}) • {fmt_num(payout)}৳{paused_badge}",
             callback_data=f"adm:c:v:{sc_tok}",
             style="primary",
             icon_custom_emoji_id="5375177250553487549",
@@ -3718,6 +3807,8 @@ def build_country_manage_view(service: str, country: str):
     payout = get_payout_sync(service, country)
     short = get_country_short_sync(service, country)
     cc_len = get_setting(f"cc_len:{service}:{country}", "0")
+    paused = is_country_paused_sync(service, country)
+    status_label = "⏸️ Paused" if paused else "▶️ Active"
 
     srv_tok = _make_srv_token(service)
     sc_tok = _make_sc_token(service, country)
@@ -3726,16 +3817,27 @@ def build_country_manage_view(service: str, country: str):
         f"🏳️ <b>COUNTRY DETAILS</b>\n\n"
         f"🏷️ <b>Service:</b> {safe_html_escape(service)}\n"
         f"🌍 <b>Country:</b> {safe_html_escape(country)}\n"
-        f"🔤 <b>Short Name:</b> <code>{safe_html_escape(short)}</code>\n"
+        f"🔤 <b>Short Name:</b> {safe_html_escape(short)}\n"
+        f"📌 <b>Status:</b> {status_label}\n"
         f"📞 <b>Available Numbers:</b> <code>{avail}</code>\n"
         f"💰 <b>Payout:</b> <code>{fmt_num(payout)} ৳</code>\n"
         f"🔢 <b>Country Code Digit:</b> <code>{html.escape(str(cc_len))}</code>"
+    )
+
+    pause_btn = (
+        create_button("Resume", callback_data=f"adm:c:togp:{sc_tok}", style="success", icon_custom_emoji_id="5370604433233177619")
+        if paused else
+        create_button("Pause", callback_data=f"adm:c:togp:{sc_tok}", style="primary", icon_custom_emoji_id="5472239203590888751")
     )
 
     buttons = [
         [create_button("Add Numbers", callback_data=f"adm:c:an:{sc_tok}", style="success", icon_custom_emoji_id="5287354223141342798")],
         [
             create_button("Edit", callback_data=f"adm:c:ed:{sc_tok}", style="primary", icon_custom_emoji_id="5370604433233177619"),
+            create_button("Clear Stock", callback_data=f"adm:c:cconf:{sc_tok}", style="danger", icon_custom_emoji_id="5422557736330106570"),
+        ],
+        [
+            pause_btn,
             create_button("Delete Country", callback_data=f"adm:c:dc:{sc_tok}", style="danger", icon_custom_emoji_id="5422557736330106570"),
         ],
         [create_button("Back", callback_data=f"adm:srv:view:{srv_tok}", style="danger", icon_custom_emoji_id="5456187398977247949")],
@@ -3753,7 +3855,7 @@ def build_country_edit_view(service: str, country: str):
         f"✏️ <b>EDIT COUNTRY</b>\n\n"
         f"🏷️ <b>Service:</b> {safe_html_escape(service)}\n"
         f"🌍 <b>Country Name:</b> {safe_html_escape(country)}\n"
-        f"🔤 <b>Short Name:</b> <code>{safe_html_escape(short)}</code>\n"
+        f"🔤 <b>Short Name:</b> {safe_html_escape(short)}\n"
         f"💰 <b>Payout:</b> <code>{fmt_num(payout)} ৳</code>\n"
         f"🔢 <b>Country Code Digit:</b> <code>{html.escape(cc_len)}</code>\n\n"
         f"Select what you want to edit:"
@@ -4307,7 +4409,7 @@ def build_allocation_keyboard(service: str, country: str, numbers: list, hide_cc
     return InlineKeyboardMarkup(buttons)
 
 def get_services_keyboard():
-    services = list(SERVICES_CACHE.keys())
+    services = [s for s in SERVICES_CACHE.keys() if get_active_countries_for_service(s)]
     if not services:
         return None, "No services currently available."
 
@@ -4419,7 +4521,7 @@ def get_admin_keyboard(use_premium: Optional[bool] = None):
                 KeyboardButton("Manage Payouts", icon_custom_emoji_id="5417924076503062111", style="primary"),
             ],
             [
-                KeyboardButton("Live Receivers", icon_custom_emoji_id="5352877703043258544", style="success"),
+                KeyboardButton("Live Receivers", icon_custom_emoji_id="5352877703043258544", style="primary"),
                 KeyboardButton("Global Settings", icon_custom_emoji_id="5258096772776991776", style="primary"),
             ],
             [
@@ -4437,7 +4539,7 @@ def get_admin_keyboard(use_premium: Optional[bool] = None):
                 KeyboardButton("💰 Manage Payouts", style="primary"),
             ],
             [
-                KeyboardButton("📡 Live Receivers", style="success"),
+                KeyboardButton("📡 Live Receivers", style="primary"),
                 KeyboardButton("⚙️ Global Settings", style="primary"),
             ],
             [
@@ -5277,7 +5379,7 @@ async def receive_edit_country_name(update: Update, context: ContextTypes.DEFAUL
     context.user_data['edit_new_country'] = new_country
     curr_short = get_country_short_sync(service, old_country)
     await update.message.reply_text(
-        f"🔤 Current Short Name: <code>{safe_html_escape(curr_short)}</code>\n\n"
+        f"🔤 Current Short Name: {safe_html_escape(curr_short)}\n\n"
         f"Enter the new <b>Short Name</b> (e.g., <code>BD</code>, <code>US</code>, <code>LK</code>), "
         f"or send <code>skip</code> to keep current:",
         parse_mode="HTML",
@@ -5364,7 +5466,7 @@ async def receive_country_name(update: Update, context: ContextTypes.DEFAULT_TYP
     if has_custom_short:
         await update.message.reply_text(
             f"🏳️ Country: <b>{safe_html_escape(country)}</b>\n"
-            f"🔤 Current short form: <code>{safe_html_escape(existing_short)}</code>\n\n"
+            f"🔤 Current short form: {safe_html_escape(existing_short)}\n\n"
             f"Enter a new <b>short form</b> (e.g., <code>BD</code>, <code>US</code>, <code>IND</code>), "
             "or send <code>skip</code> to keep the current one:",
             parse_mode="HTML"
@@ -6830,6 +6932,54 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, kbd = build_service_manage_view(service)
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
 
+    elif data.startswith("adm:c:cconf:"):
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        service, country = _resolve_sc_token(data.split(":", 3)[3])
+        sc_tok = _make_sc_token(service, country)
+        avail = SERVICES_CACHE.get(service, {}).get(country, 0)
+        kbd = InlineKeyboardMarkup([
+            [
+                create_button("Yes, Clear Stock", callback_data=f"adm:c:cdo:{sc_tok}", style="danger", icon_custom_emoji_id="5422557736330106570"),
+                create_button("Cancel", callback_data=f"adm:c:v:{sc_tok}", style="primary", icon_custom_emoji_id="5456187398977247949"),
+            ]
+        ])
+        await query.edit_message_text(
+            f"⚠️ <b>CONFIRM CLEAR STOCK</b>\n\n"
+            f"Are you sure you want to clear all <b>{avail}</b> available unallocated numbers for "
+            f"<b>{safe_html_escape(country)}</b> in <b>{safe_html_escape(service)}</b>?\n\n"
+            f"<i>Note: Clearing stock will automatically pause this country.</i>",
+            reply_markup=kbd, parse_mode="HTML",
+        )
+
+    elif data.startswith("adm:c:cdo:"):
+        if not user_is_admin: await query.answer(); return
+        service, country = _resolve_sc_token(data.split(":", 3)[3])
+        cleared = await run_db(clear_country_stock_db, service, country)
+        await query.answer(f"Cleared {cleared} numbers! Country auto-paused.", show_alert=True)
+        text, kbd = await run_db(build_country_manage_view, service, country)
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
+
+    elif data.startswith("adm:c:togp:"):
+        if not user_is_admin: await query.answer(); return
+        service, country = _resolve_sc_token(data.split(":", 3)[3])
+        currently_paused = is_country_paused_sync(service, country)
+        if currently_paused:
+            avail = SERVICES_CACHE.get(service, {}).get(country, 0)
+            if avail <= 0:
+                await query.answer("❌ Cannot resume! No available numbers in stock. Add numbers first.", show_alert=True)
+                return
+            await run_db(set_country_paused_sync, service, country, False)
+            await query.answer("▶️ Country resumed!", show_alert=True)
+        else:
+            await run_db(set_country_paused_sync, service, country, True)
+            await query.answer("⏸️ Country paused!", show_alert=True)
+        text, kbd = await run_db(build_country_manage_view, service, country)
+        try:
+            await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
+        except Exception:
+            pass
+
     elif data.startswith("adm:cnt:delli:"):
         if not user_is_admin: await query.answer(); return
         await query.answer()
@@ -7120,9 +7270,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clean_service = data.split("_", 1)[1]
         all_services = list(SERVICES_CACHE.keys())
         service = _resolve_full_key(clean_service, all_services)
-        countries = get_countries_for_service(service)
+        countries = get_active_countries_for_service(service)
         if not countries:
-            await query.edit_message_text("No countries available.")
+            await query.edit_message_text("No countries currently available for this service.")
             return
 
         buttons = []
@@ -7144,9 +7294,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     elif data.startswith("cnt_"):
-        await query.answer()
         parts = data.split("_", 2)
         if len(parts) < 3:
+            await query.answer()
             await query.edit_message_text("Invalid command.")
             return
         service_clean, country_clean = parts[1], parts[2]
@@ -7156,6 +7306,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             country = _resolve_full_key(country_clean, list(SERVICES_CACHE[service].keys()))
         else:
             country = country_clean
+
+        if is_country_paused_sync(service, country) or SERVICES_CACHE.get(service, {}).get(country, 0) <= 0:
+            await query.answer("⏸️ This country is currently paused or out of stock.", show_alert=True)
+            return
+
+        await query.answer()
 
         if not user_is_admin:
             ok, wait_s = _check_number_cooldown(user_id)
@@ -7232,6 +7388,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             country = _resolve_full_key(country_clean, list(SERVICES_CACHE[service].keys()))
         else:
             country = country_clean
+
+        if is_country_paused_sync(service, country) or SERVICES_CACHE.get(service, {}).get(country, 0) <= 0:
+            await query.answer("⏸️ This country is currently paused or out of stock.", show_alert=True)
+            return
 
         if not user_is_admin:
             ok, wait_s = _check_number_cooldown(user_id)
