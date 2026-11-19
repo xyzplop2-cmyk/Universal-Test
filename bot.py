@@ -1089,11 +1089,15 @@ async def _process_hybrid_item(panel_id: str, item: dict, context_holder: dict, 
 
 def _augestel_ws_listener(ws, panel_id: str):
     """Listens to live-sms websocket payload (Synchronous callback for Playwright)"""
-    logger.info(f"🔗 WebSocket Connected for panel {panel_id} | URL: {ws.url}")
+    # 👈 এখানে সব ওয়েবসকেট URL দেখতে পাবেন
+    logger.info(f"🔗 WebSocket Detected for panel {panel_id} | URL: {ws.url}")
     
     def on_message(payload):
         try:
             text = payload if isinstance(payload, str) else payload.decode('utf-8')
+            # 👈 র ডাটা আসছে কি না দেখার জন্য ডিবাগ লগ (শুধু চেক করার জন্য)
+            logger.debug(f"[WS RAW DATA]: {text[:200]}") 
+            
             data = json.loads(text)
             
             if data.get("type") != "new_message":
@@ -1118,7 +1122,6 @@ def _augestel_ws_listener(ws, panel_id: str):
             }
             
             ctx = AUGESTEL_SESSIONS.get(str(panel_id), {}).get("state", {})
-            # Playwright ইভেন্ট থেকে ডাটা নিয়ে মেইন ফাংশনে পাঠানো হচ্ছে
             asyncio.create_task(_process_hybrid_item(str(panel_id), item, ctx, source="WS"))
             
         except Exception as e:
@@ -1240,6 +1243,9 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
         page = await context.new_page()
         
         # Start Listening for WebSockets BEFORE navigation
+        context.on("websocket", lambda ws: _augestel_ws_listener(ws, str(panel_id)))
+
+        page = await context.new_page()
         page.on("websocket", lambda ws: _augestel_ws_listener(ws, str(panel_id)))
         
         await page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
