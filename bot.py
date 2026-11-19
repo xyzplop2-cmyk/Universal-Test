@@ -1244,7 +1244,9 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 800},
         )
+        page = await context.new_page()
         
+        # Start Listening for WebSockets BEFORE navigation
         context.on("websocket", lambda ws: _augestel_ws_listener(ws, str(panel_id)))
 
         page = await context.new_page()
@@ -1271,95 +1273,17 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
         await page.wait_for_timeout(3000)
         logger.info(f"✅ Augestel Dashboard loaded for {panel_id}. Waiting for WebSocket frames...")
         
-        # ============================================================
-        # 🧠 SMART ADAPTIVE RELOAD — Traffic/DOM-row based, crashproof
-        # ============================================================
+        # Auto Refresh Mechanism (Every 3 hours)
         async def periodic_refresh():
-            ROW_LIMIT = 100                # DOM row cross হলে reload (high traffic)
-            MAX_AGE = 3 * 3600             # Slow traffic এ সর্বোচ্চ 3h
-            CHECK_INTERVAL = 60            # প্রতি 60s চেক
-            last_reload = time.time()
-            
-            logger.info(
-                f"🧠 Smart reload active for {panel_id} "
-                f"(row_limit={ROW_LIMIT}, max_age={MAX_AGE//3600}h, check={CHECK_INTERVAL}s)"
-            )
-            
             while AUGESTEL_SESSIONS.get(str(panel_id)):
-                await asyncio.sleep(CHECK_INTERVAL)
-                
-                sess = AUGESTEL_SESSIONS.get(str(panel_id))
-                if not sess:
-                    break
-                
+                await asyncio.sleep(10800) # 3 hours
+                logger.info(f"Refreshing Augestel Page for {panel_id}")
                 try:
-                    p = sess.get("page")
-                    if not p:
-                        break
-                    
-                    # ── Session dead check ──
-                    try:
-                        current_url = (p.url or "").lower()
-                    except Exception:
-                        current_url = ""
-                    if "login" in current_url or "signin" in current_url:
-                        logger.warning(f"⚠️ Session expired {panel_id}, forcing re-login")
-                        await _augestel_close_session(panel_id)
-                        break
-                    
-                    # ── DOM row count (সব tbody এর মোট tr) ──
-                    try:
-                        row_count = await p.evaluate("""
-                            () => {
-                                let c = 0;
-                                document.querySelectorAll('table tbody').forEach(t => {
-                                    c += t.querySelectorAll('tr').length;
-                                });
-                                return c;
-                            }
-                        """)
-                    except Exception:
-                        row_count = 0
-                    
-                    now = time.time()
-                    age = now - last_reload
-                    
-                    # ── Reload decision ──
-                    should_reload = False
-                    reason = ""
-                    
-                    if row_count >= ROW_LIMIT:
-                        should_reload = True
-                        reason = f"row_limit ({row_count}>={ROW_LIMIT})"
-                    elif age >= MAX_AGE:
-                        should_reload = True
-                        reason = f"max_age ({int(age/60)}min>={MAX_AGE//3600}h)"
-                    
-                    if should_reload:
-                        logger.info(
-                            f"🔄 Smart reload {panel_id}: {reason}, "
-                            f"rows={row_count}, age={int(age/60)}min"
-                        )
-                        try:
-                            await p.reload(wait_until="domcontentloaded", timeout=30000)
-                            await p.wait_for_timeout(3000)
-                        except Exception as re:
-                            logger.error(f"Reload failed {panel_id}: {re}")
-                            continue
-                        
-                        last_reload = time.time()
-                        
-                        # Post-reload session check
-                        try:
-                            if "login" in (p.url or "").lower():
-                                logger.warning(f"⚠️ Session expired after reload {panel_id}")
-                                await _augestel_close_session(panel_id)
-                                break
-                        except Exception:
-                            pass
-                        
+                    p = AUGESTEL_SESSIONS.get(str(panel_id), {}).get("page")
+                    if p:
+                        await p.reload(wait_until="domcontentloaded")
                 except Exception as e:
-                    logger.error(f"Smart reload error {panel_id}: {e}")
+                    logger.error(f"Auto Refresh failed: {e}")
                     
         asyncio.create_task(periodic_refresh())
         
