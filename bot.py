@@ -1053,7 +1053,7 @@ def _make_otp_hash(number: str, msg: str, dt: str) -> str:
     raw = f"{number}|{msg.strip()[:100]}|{clean_dt}"
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
-async def _process_hybrid_item(panel_id: str, item: dict, context_holder: dict):
+async def _process_hybrid_item(panel_id: str, item: dict, context_holder: dict, source: str = "Unknown"):
     """Processes items from either WebSocket or API, handles deduplication."""
     num = re.sub(r'\D', '', str(item.get("num", "")))
     msg = str(item.get("message", "")).strip()
@@ -1067,13 +1067,12 @@ async def _process_hybrid_item(panel_id: str, item: dict, context_holder: dict):
     # Deduplication Check
     otp_hash = _make_otp_hash(num, msg, dt)
     if otp_hash in AUGESTEL_PROCESSED_OTPS:
-        logger.info(f"[{source}] Duplicate skipped: {num} | {dt}")
-        return # Already processed (either via WS or API)
+        logger.info(f"[{source}] Duplicate skipped: {num} | {dt}") 
+        return 
     
     AUGESTEL_PROCESSED_OTPS.add(otp_hash)
-    logger.info(f"[{source}] New OTP Captured: {num} | {dt} | CLI: {cli}")
+    logger.info(f"[{source}] New OTP Captured: {num} | {dt} | CLI: {cli}") # 👈 এখানে সোর্স দেখতে পাবেন
     
-    # Prepare item for the main OTP processor
     final_item = {
         "num": num,
         "message": msg,
@@ -1081,10 +1080,9 @@ async def _process_hybrid_item(panel_id: str, item: dict, context_holder: dict):
         "payout": payout,
         "cli": cli,
         "panel_id": panel_id,
-        "source": source,
+        "source": source, # 👈 সোর্স সেভ করা হলো
     }
     
-    # Push to queue (which the main bot loop reads)
     queue = context_holder.get("queue")
     if queue:
         await queue.put(final_item)
