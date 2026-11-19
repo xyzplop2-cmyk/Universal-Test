@@ -11,7 +11,8 @@ import time
 import datetime
 import threading
 import io
-from collections import OrderedDict, deque
+import gc
+from collections import OrderedDict
 from functools import wraps
 from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import urljoin
@@ -70,7 +71,7 @@ CURRENT_DB_MODE = "Cloud (Double)"
 
 OTP_ID_RETENTION_SECONDS = 30 * 24 * 60 * 60
 CLEANUP_EVERY_N_CYCLES = 720
-PROCESSED_IDS_MAX = 500000
+PROCESSED_IDS_MAX = 25000
 
 DEFAULT_PAYOUT = 0.5
 BROADCAST_CONCURRENCY = 20
@@ -81,7 +82,7 @@ FIREBASE_BACKUP_INTERVAL = 600
 FIREBASE_BACKUP_BATCH_SIZE = 500
 WEEKLY_RESET_CHECK_INTERVAL = 300
 LEADERBOARD_CACHE_TTL = 60
-MAX_KNOWN_USERS = 20000
+MAX_KNOWN_USERS = 2000
 SUPABASE_PAGE_SIZE = 1000
 
 _BATCH_RPC_AVAILABLE = True
@@ -105,25 +106,33 @@ _BACKGROUND_TASKS = set()
 
 _SEND_SEMAPHORE: Optional[asyncio.Semaphore] = None
 _CHAT_LOCKS: Dict[int, asyncio.Lock] = {}
+_CHAT_LOCKS_MAX = 500
 _BROADCAST_SEND_LOCK: Optional[asyncio.Lock] = None
 _NEXT_BROADCAST_SEND_AT = 0.0
 _BOT_INFO_CACHE: Dict[str, Any] = {"username": None, "link": "https://t.me", "ts": 0.0}
 _PANEL_INFO_CACHE: Dict[str, Dict[str, Any]] = {}
 
-# 📡 LIVE OTP RECEIVERS STREAM
+# 📡 LIVE OTP RECEIVERS STREAM (DB-BACKED, 24H RETENTION)
 LIVE_RECEIVERS_MAX_EVENTS = 500
-LIVE_RECEIVER_EVENTS: deque = deque(maxlen=LIVE_RECEIVERS_MAX_EVENTS)
+LIVE_RECEIVERS_RETENTION_SECONDS = 24 * 60 * 60
+_LIVE_EVENTS_TABLE_MISSING = False
+_LIVE_EVENTS_FALLBACK_KEY = "live_otp_events_fallback"
+_LIVE_EVENTS_LOCK = threading.Lock()
+
 _USER_IDENTITY_CACHE: Dict[int, Dict[str, Any]] = {}
 _USER_IDENTITY_CACHE_TTL = 300.0
+_USER_IDENTITY_CACHE_MAX = 500
 _USE_PREMIUM_EMOJIS = True
 
 # 🛡️ ANTI-ABUSE STATE
 _LAST_NUMBER_CLAIM: Dict[int, float] = {}
 _RECENT_NUMBER_CHANGES: Dict[int, list] = {}
+_ANTI_ABUSE_STATE_MAX = 2000
 _IN_MEMORY_BANNED: set = set()
 _IN_MEMORY_BAN_REASONS: Dict[int, str] = {}
 _NOT_BANNED_CACHE: Dict[int, float] = {}
 _NOT_BANNED_CACHE_TTL = 60.0
+_NOT_BANNED_CACHE_MAX = 2000
 
 # 🔐 CAPTCHA PANEL
 CAPTCHA_SESSIONS: Dict[str, dict] = {}
@@ -139,6 +148,63 @@ AUGESTEL_MESSAGES_PATH = "/Switchfy/client/sms-statistics/messages"
 # 🔒 FORCE JOIN CACHE
 _FORCE_JOIN_CACHE: Dict[int, float] = {}
 _FORCE_JOIN_CACHE_TTL = 60.0
+_FORCE_JOIN_CACHE_MAX = 2000
+
+
+def _prune_ts_cache(cache: dict, ttl: float, max_size: int, now: Optional[float] = None):
+    if now is None:
+        now = time.time()
+    cutoff = now - ttl
+    expired = [k for k, ts in list(cache.items()) if ts < cutoff]
+    for k in expired:
+        cache.pop(k, None)
+    overflow = len(cache) - max_size
+    if overflow > 0:
+        for k in list(cache.keys())[:overflow]:
+            cache.pop(k, None)
+
+
+def _prune_identity_cache(now: Optional[float] = None):
+    if now is None:
+        now = time.time()
+    cutoff = now - _USER_IDENTITY_CACHE_TTL
+    expired = [k for k, v in list(_USER_IDENTITY_CACHE.items()) if float(v.get("ts", 0.0)) < cutoff]
+    for k in expired:
+        _USER_IDENTITY_CACHE.pop(k, None)
+    overflow = len(_USER_IDENTITY_CACHE) - _USER_IDENTITY_CACHE_MAX
+    if overflow > 0:
+        for k in list(_USER_IDENTITY_CACHE.keys())[:overflow]:
+            _USER_IDENTITY_CACHE.pop(k, None)
+
+
+def prune_runtime_caches():
+    now_wall = time.time()
+    now_mono = time.monotonic()
+    _prune_ts_cache(_NOT_BANNED_CACHE, _NOT_BANNED_CACHE_TTL, _NOT_BANNED_CACHE_MAX, now=now_wall)
+    _prune_ts_cache(_FORCE_JOIN_CACHE, _FORCE_JOIN_CACHE_TTL, _FORCE_JOIN_CACHE_MAX, now=now_wall)
+    _prune_identity_cache(now=now_wall)
+    _prune_ts_cache(_LAST_NUMBER_CLAIM, max(NUMBER_CLAIM_COOLDOWN * 4, 60.0), _ANTI_ABUSE_STATE_MAX, now=now_mono)
+    try:
+        win_s = float(get_abuse_ban_window())
+    except Exception:
+        win_s = float(NUMBER_CHANGE_WINDOW)
+    cutoff_mono = now_mono - max(win_s, 60.0)
+    for k, lst in list(_RECENT_NUMBER_CHANGES.items()):
+        kept = [t for t in lst if t >= cutoff_mono]
+        if kept:
+            _RECENT_NUMBER_CHANGES[k] = kept
+        else:
+            _RECENT_NUMBER_CHANGES.pop(k, None)
+    overflow = len(_RECENT_NUMBER_CHANGES) - _ANTI_ABUSE_STATE_MAX
+    if overflow > 0:
+        for k in list(_RECENT_NUMBER_CHANGES.keys())[:overflow]:
+            _RECENT_NUMBER_CHANGES.pop(k, None)
+    if len(_CHAT_LOCKS) > _CHAT_LOCKS_MAX:
+        for k in list(_CHAT_LOCKS.keys()):
+            if not _CHAT_LOCKS[k].locked():
+                _CHAT_LOCKS.pop(k, None)
+                if len(_CHAT_LOCKS) <= _CHAT_LOCKS_MAX // 2:
+                    break
 
 
 def _get_send_semaphore() -> asyncio.Semaphore:
@@ -163,13 +229,14 @@ async def _wait_for_broadcast_slot() -> None:
 def _get_chat_lock(chat_id: int) -> asyncio.Lock:
     lock = _CHAT_LOCKS.get(chat_id)
     if lock is None:
-        if len(_CHAT_LOCKS) > 3000:
+        if len(_CHAT_LOCKS) > _CHAT_LOCKS_MAX:
             evicted = 0
+            target_evict = max(1, _CHAT_LOCKS_MAX // 2)
             for k in list(_CHAT_LOCKS.keys()):
                 if not _CHAT_LOCKS[k].locked():
                     _CHAT_LOCKS.pop(k, None)
                     evicted += 1
-                    if evicted >= 1500:
+                    if evicted >= target_evict:
                         break
         lock = asyncio.Lock()
         _CHAT_LOCKS[chat_id] = lock
@@ -320,7 +387,7 @@ class TimedLRUDict:
 KNOWN_USERS = LRUSet(maxsize=MAX_KNOWN_USERS)
 LEADERBOARD_CACHE = {"data": None, "ts": 0}
 
-AUGESTEL_PROCESSED_OTPS = TimedLRUDict(maxsize=200000, ttl=OTP_ID_RETENTION_SECONDS) 
+AUGESTEL_PROCESSED_OTPS = TimedLRUDict(maxsize=10000, ttl=OTP_ID_RETENTION_SECONDS) 
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -414,7 +481,9 @@ def strip_all_emojis(text: str) -> str:
 
 
 _SC_CB_CACHE: Dict[str, Tuple[str, str]] = {}
+_SC_CB_CACHE_MAX = 1000
 _SRV_CB_CACHE: Dict[str, str] = {}
+_SRV_CB_CACHE_MAX = 500
 
 
 def _cb_clean(name: str) -> str:
@@ -437,8 +506,9 @@ def _make_srv_token(service: str) -> str:
     if clean and len(clean.encode("utf-8")) <= 44 and not clean.startswith("#"):
         return clean
     h = hashlib.md5(str(service).encode("utf-8")).hexdigest()[:10]
-    if len(_SRV_CB_CACHE) > 2000:
-        _SRV_CB_CACHE.clear()
+    if len(_SRV_CB_CACHE) >= _SRV_CB_CACHE_MAX and h not in _SRV_CB_CACHE:
+        for k in list(_SRV_CB_CACHE.keys())[:max(1, _SRV_CB_CACHE_MAX // 2)]:
+            _SRV_CB_CACHE.pop(k, None)
     _SRV_CB_CACHE[h] = service
     return f"#{h}"
 
@@ -461,8 +531,9 @@ def _make_sc_token(service: str, country: str) -> str:
     if s_clean and c_clean and ":" not in s_clean and len(combined.encode("utf-8")) <= 44 and not s_clean.startswith("#"):
         return combined
     h = hashlib.md5(f"{service}\x00{country}".encode("utf-8")).hexdigest()[:10]
-    if len(_SC_CB_CACHE) > 5000:
-        _SC_CB_CACHE.clear()
+    if len(_SC_CB_CACHE) >= _SC_CB_CACHE_MAX and h not in _SC_CB_CACHE:
+        for k in list(_SC_CB_CACHE.keys())[:max(1, _SC_CB_CACHE_MAX // 2)]:
+            _SC_CB_CACHE.pop(k, None)
     _SC_CB_CACHE[h] = (service, country)
     return f"#{h}"
 
@@ -774,6 +845,8 @@ def is_user_banned_sync(user_id: int) -> bool:
     ts = _NOT_BANNED_CACHE.get(user_id)
     if ts and (now - ts) < _NOT_BANNED_CACHE_TTL:
         return False
+    if len(_NOT_BANNED_CACHE) >= _NOT_BANNED_CACHE_MAX:
+        _prune_ts_cache(_NOT_BANNED_CACHE, _NOT_BANNED_CACHE_TTL, _NOT_BANNED_CACHE_MAX - 1, now=now)
     try:
         res = supabase.table("users").select("is_banned").eq("user_id", user_id).limit(1).execute()
         if res.data:
@@ -801,6 +874,8 @@ def set_user_banned_sync(user_id: int, banned: bool, reason: str = "") -> bool:
     else:
         _IN_MEMORY_BANNED.discard(user_id)
         _IN_MEMORY_BAN_REASONS.pop(user_id, None)
+        if len(_NOT_BANNED_CACHE) >= _NOT_BANNED_CACHE_MAX:
+            _prune_ts_cache(_NOT_BANNED_CACHE, _NOT_BANNED_CACHE_TTL, _NOT_BANNED_CACHE_MAX - 1)
         _NOT_BANNED_CACHE[user_id] = time.time()
 
     update_data = {"is_banned": banned, "dirty": True}
@@ -864,9 +939,9 @@ def get_inactive_autoban_min_otps() -> int:
 
 
 def _check_number_cooldown(user_id: int) -> Tuple[bool, int]:
-    if len(_LAST_NUMBER_CLAIM) > 50000:
-        _LAST_NUMBER_CLAIM.clear()
     now = time.monotonic()
+    if len(_LAST_NUMBER_CLAIM) >= _ANTI_ABUSE_STATE_MAX:
+        _prune_ts_cache(_LAST_NUMBER_CLAIM, max(NUMBER_CLAIM_COOLDOWN * 4, 60.0), _ANTI_ABUSE_STATE_MAX - 1, now=now)
     last = _LAST_NUMBER_CLAIM.get(user_id)
     if last is not None:
         elapsed = now - last
@@ -878,12 +953,21 @@ def _check_number_cooldown(user_id: int) -> Tuple[bool, int]:
 def _record_change_and_check_ban(user_id: int) -> Tuple[bool, int]:
     if not is_abuse_autoban_enabled():
         return False, 0
-    if len(_RECENT_NUMBER_CHANGES) > 50000:
-        _RECENT_NUMBER_CHANGES.clear()
     window_s = float(get_abuse_ban_window())
     thresh = get_abuse_ban_threshold()
     now = time.monotonic()
     cutoff = now - window_s
+    if len(_RECENT_NUMBER_CHANGES) >= _ANTI_ABUSE_STATE_MAX:
+        for k in list(_RECENT_NUMBER_CHANGES.keys()):
+            kept = [t for t in _RECENT_NUMBER_CHANGES[k] if t >= cutoff]
+            if kept:
+                _RECENT_NUMBER_CHANGES[k] = kept
+            else:
+                _RECENT_NUMBER_CHANGES.pop(k, None)
+        overflow = len(_RECENT_NUMBER_CHANGES) - (_ANTI_ABUSE_STATE_MAX - 1)
+        if overflow > 0:
+            for k in list(_RECENT_NUMBER_CHANGES.keys())[:overflow]:
+                _RECENT_NUMBER_CHANGES.pop(k, None)
     lst = [t for t in _RECENT_NUMBER_CHANGES.get(user_id, []) if t >= cutoff]
     lst.append(now)
     _RECENT_NUMBER_CHANGES[user_id] = lst
@@ -2049,8 +2133,8 @@ def get_user_identities_batch_sync(user_ids: list) -> Dict[int, Dict[str, str]]:
             missing.append(uid)
 
     if missing:
-        if len(_USER_IDENTITY_CACHE) > 10000:
-            _USER_IDENTITY_CACHE.clear()
+        if len(_USER_IDENTITY_CACHE) >= _USER_IDENTITY_CACHE_MAX:
+            _prune_identity_cache(now=now)
         try:
             for i in range(0, len(missing), 500):
                 chunk = missing[i:i + 500]
@@ -2509,6 +2593,8 @@ async def is_user_force_join_ok(bot, user_id: int, use_cache: bool = True) -> bo
             return True
     ok, _ = await check_user_joined_all(bot, user_id, chats)
     if ok:
+        if len(_FORCE_JOIN_CACHE) >= _FORCE_JOIN_CACHE_MAX:
+            _prune_ts_cache(_FORCE_JOIN_CACHE, _FORCE_JOIN_CACHE_TTL, _FORCE_JOIN_CACHE_MAX - 1, now=now)
         _FORCE_JOIN_CACHE[user_id] = now
     else:
         _FORCE_JOIN_CACHE.pop(user_id, None)
@@ -2583,10 +2669,13 @@ def save_user(user_id: int, first_name: str = "", username: str = ""):
     clean_fname = first_name.strip() if first_name else ""
     clean_uname = (username or "").strip().lstrip("@")
     if clean_fname or clean_uname:
+        now_wall = time.time()
+        if len(_USER_IDENTITY_CACHE) >= _USER_IDENTITY_CACHE_MAX and user_id not in _USER_IDENTITY_CACHE:
+            _prune_identity_cache(now=now_wall)
         _USER_IDENTITY_CACHE[user_id] = {
             "first_name": clean_fname,
             "username": clean_uname,
-            "ts": time.time(),
+            "ts": now_wall,
         }
     if user_id in KNOWN_USERS:
         return
@@ -2794,8 +2883,51 @@ def _compute_inactive_days(user_row: dict, today_bd: Optional[datetime.date] = N
     return 9999
 
 
+_USERS_SUMMARY_COLS_CACHE: Optional[str] = None
+_USERS_SUMMARY_COL_SETS = (
+    "user_id, first_name, username, balance, total_otps, weekly_otps, last_earn_date, is_banned, created_at",
+    "user_id, first_name, username, balance, total_otps, weekly_otps, last_earn_date, is_banned",
+    "user_id, first_name, balance, total_otps, weekly_otps, last_earn_date",
+)
+
+
+def _fetch_users_summary_rows_sync(filters: Optional[dict] = None) -> list:
+    global _USERS_SUMMARY_COLS_CACHE
+    candidates = (
+        [_USERS_SUMMARY_COLS_CACHE] + [c for c in _USERS_SUMMARY_COL_SETS if c != _USERS_SUMMARY_COLS_CACHE]
+        if _USERS_SUMMARY_COLS_CACHE else list(_USERS_SUMMARY_COL_SETS)
+    )
+    for cols in candidates:
+        if filters and "is_banned" in filters and "is_banned" not in cols:
+            continue
+        try:
+            all_rows = []
+            offset = 0
+            while True:
+                q = supabase.table("users").select(cols)
+                if filters:
+                    for k, v in filters.items():
+                        q = q.eq(k, v)
+                r = q.range(offset, offset + SUPABASE_PAGE_SIZE - 1).execute()
+                if not r.data:
+                    break
+                all_rows.extend(r.data)
+                if len(r.data) < SUPABASE_PAGE_SIZE:
+                    break
+                offset += SUPABASE_PAGE_SIZE
+            _USERS_SUMMARY_COLS_CACHE = cols
+            return all_rows
+        except Exception as e:
+            err_l = str(e).lower()
+            if "column" in err_l or "does not exist" in err_l or "pgrst" in err_l:
+                continue
+            logger.error(f"_fetch_users_summary_rows_sync error: {e}")
+            return []
+    return []
+
+
 def get_users_ordered_sync(sort_mode: str = "recent") -> list:
-    rows = get_all_users_data_sync()
+    rows = _fetch_users_summary_rows_sync()
     if not rows:
         return []
     has_ts = any(r.get("created_at") for r in rows)
@@ -2811,20 +2943,36 @@ def get_users_ordered_sync(sort_mode: str = "recent") -> list:
 
 
 def get_banned_users_list_sync() -> list:
-    rows = get_users_ordered_sync("recent")
-    result = []
-    for r in rows:
-        uid = int(r.get("user_id") or 0)
-        if not uid:
-            continue
-        if bool(r.get("is_banned")) or (uid in _IN_MEMORY_BANNED):
-            result.append(r)
-    return result
+    rows = _fetch_users_summary_rows_sync(filters={"is_banned": True})
+    seen_uids = {int(r.get("user_id") or 0) for r in rows if r.get("user_id")}
+    missing_mem = [uid for uid in _IN_MEMORY_BANNED if uid and uid not in seen_uids]
+    if missing_mem:
+        cols = _USERS_SUMMARY_COLS_CACHE or _USERS_SUMMARY_COL_SETS[-1]
+        for i in range(0, len(missing_mem), 200):
+            chunk = missing_mem[i:i + 200]
+            try:
+                r = supabase.table("users").select(cols).in_("user_id", chunk).execute()
+                for row in r.data or []:
+                    rows.append(row)
+                    seen_uids.add(int(row.get("user_id") or 0))
+            except Exception:
+                pass
+        for uid in missing_mem:
+            if uid not in seen_uids:
+                rows.append({"user_id": uid, "first_name": f"User {uid}", "balance": 0.0, "is_banned": True})
+    if not rows and _IN_MEMORY_BANNED:
+        rows = [{"user_id": uid, "first_name": f"User {uid}", "balance": 0.0, "is_banned": True} for uid in _IN_MEMORY_BANNED]
+    has_ts = any(r.get("created_at") for r in rows)
+    if has_ts:
+        rows.sort(key=lambda r: (str(r.get("created_at") or ""), int(r.get("user_id") or 0)), reverse=True)
+    else:
+        rows.reverse()
+    return rows
 
 
 def get_inactive_users_list_sync(window: str = "7d") -> list:
     win_days = {"24h": 1, "3d": 3, "7d": 7, "15d": 15, "30d": 30}.get(window, 7)
-    rows = get_all_users_data_sync()
+    rows = _fetch_users_summary_rows_sync()
     today_bd = datetime.datetime.now(_BD_TZ).date()
     result = []
     for r in rows:
@@ -2847,7 +2995,7 @@ def run_inactive_autoban_sweep_sync() -> list:
         return []
     min_days = get_inactive_autoban_days()
     min_otps = get_inactive_autoban_min_otps()
-    rows = get_all_users_data_sync()
+    rows = _fetch_users_summary_rows_sync()
     today_bd = datetime.datetime.now(_BD_TZ).date()
     banned_list = []
     for r in rows:
@@ -3570,19 +3718,22 @@ def load_seen_otp_ids_sync() -> dict:
     result = {}
     try:
         offset = 0
-        while True:
+        while len(result) < PROCESSED_IDS_MAX:
+            remaining = PROCESSED_IDS_MAX - len(result)
+            batch_limit = min(SUPABASE_PAGE_SIZE, remaining)
             r = (supabase.table("seen_otps")
                  .select("msg_id, ts")
                  .gte("ts", cutoff)
-                 .range(offset, offset + SUPABASE_PAGE_SIZE - 1)
+                 .order("ts", desc=True)
+                 .range(offset, offset + batch_limit - 1)
                  .execute())
             if not r.data:
                 break
             for row in r.data:
                 result[row["msg_id"]] = row.get("ts", 0)
-            if len(r.data) < SUPABASE_PAGE_SIZE:
+            if len(r.data) < batch_limit:
                 break
-            offset += SUPABASE_PAGE_SIZE
+            offset += batch_limit
     except Exception as e:
         logger.error(f"Supabase load seen otps error: {e}")
     return result
@@ -3780,23 +3931,155 @@ def _format_relative_time(ts: float) -> str:
     return f"{diff // 86400}d ago"
 
 
-def _filter_live_events(filter_mode: str = "all") -> list:
-    snapshot = list(LIVE_RECEIVER_EVENTS)
-    snapshot.reverse()  # newest first
+def _is_missing_table_error(err: Exception, table_name: str) -> bool:
+    msg = str(err).lower()
+    return (
+        "pgrst205" in msg
+        or "42p01" in msg
+        or "does not exist" in msg
+        or "could not find the table" in msg
+        or (table_name.lower() in msg and ("not found" in msg or "schema cache" in msg))
+    )
+
+
+def _normalize_live_event(ev: dict, default_ts: Optional[float] = None) -> dict:
+    ts_val = float(ev.get("ts") or (default_ts if default_ts is not None else time.time()))
+    return {
+        "user_id": int(ev.get("user_id") or 0),
+        "first_name": str(ev.get("first_name") or "")[:64],
+        "username": str(ev.get("username") or "").strip().lstrip("@")[:64],
+        "service": str(ev.get("service") or "Service")[:64],
+        "country": str(ev.get("country") or "Unknown")[:64],
+        "number": str(ev.get("number") or "")[:40],
+        "otp_code": str(ev.get("otp_code") or "")[:32],
+        "payout": float(ev.get("payout") or 0.0),
+        "ts": ts_val,
+    }
+
+
+def _read_live_events_fallback_list() -> list:
+    raw = get_setting(_LIVE_EVENTS_FALLBACK_KEY, "")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return parsed
+    except Exception:
+        pass
+    return []
+
+
+def _write_live_events_fallback_list(items: list):
+    cutoff = time.time() - LIVE_RECEIVERS_RETENTION_SECONDS
+    pruned = [ev for ev in items if float(ev.get("ts") or 0) >= cutoff]
+    pruned.sort(key=lambda ev: float(ev.get("ts") or 0), reverse=True)
+    if len(pruned) > LIVE_RECEIVERS_MAX_EVENTS:
+        pruned = pruned[:LIVE_RECEIVERS_MAX_EVENTS]
+    set_setting(_LIVE_EVENTS_FALLBACK_KEY, json.dumps(pruned, separators=(",", ":")))
+
+
+def record_live_receiver_events_batch_sync(events: list):
+    global _LIVE_EVENTS_TABLE_MISSING
+    if not events:
+        return
     now = time.time()
-    if filter_mode == "5m":
-        cutoff = now - 300
-        return [ev for ev in snapshot if ev.get("ts", 0) >= cutoff]
-    if filter_mode == "15m":
-        cutoff = now - 900
-        return [ev for ev in snapshot if ev.get("ts", 0) >= cutoff]
-    if filter_mode == "30m":
-        cutoff = now - 1800
-        return [ev for ev in snapshot if ev.get("ts", 0) >= cutoff]
-    if filter_mode == "1h":
-        cutoff = now - 3600
-        return [ev for ev in snapshot if ev.get("ts", 0) >= cutoff]
-    return snapshot
+    clean_events = [_normalize_live_event(ev, default_ts=now) for ev in events if ev.get("user_id")]
+    if not clean_events:
+        return
+
+    if not _LIVE_EVENTS_TABLE_MISSING:
+        try:
+            supabase.table("live_otp_events").insert(clean_events).execute()
+            return
+        except Exception as e:
+            if _is_missing_table_error(e, "live_otp_events"):
+                with _LIVE_EVENTS_LOCK:
+                    if not _LIVE_EVENTS_TABLE_MISSING:
+                        logger.warning(
+                            "Table 'live_otp_events' not found in Supabase; using 'settings' fallback until table is created."
+                        )
+                        _LIVE_EVENTS_TABLE_MISSING = True
+            else:
+                logger.error(f"record_live_receiver_events_batch_sync error: {e}")
+                return
+
+    with _LIVE_EVENTS_LOCK:
+        existing = _read_live_events_fallback_list()
+        existing.extend(clean_events)
+        _write_live_events_fallback_list(existing)
+
+
+def get_live_receiver_events_sync(
+    filter_mode: str = "all",
+    limit: int = LIVE_RECEIVERS_MAX_EVENTS,
+) -> list:
+    global _LIVE_EVENTS_TABLE_MISSING
+    if filter_mode not in ("5m", "15m", "30m", "1h", "all"):
+        filter_mode = "all"
+    window_sec = {
+        "5m": 300,
+        "15m": 900,
+        "30m": 1800,
+        "1h": 3600,
+        "all": LIVE_RECEIVERS_RETENTION_SECONDS,
+    }[filter_mode]
+    cutoff = time.time() - window_sec
+    safe_limit = max(1, min(int(limit or LIVE_RECEIVERS_MAX_EVENTS), LIVE_RECEIVERS_MAX_EVENTS))
+
+    if not _LIVE_EVENTS_TABLE_MISSING:
+        try:
+            r = (
+                supabase.table("live_otp_events")
+                .select("user_id, first_name, username, service, country, number, otp_code, payout, ts")
+                .gte("ts", cutoff)
+                .order("ts", desc=True)
+                .limit(safe_limit)
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            if _is_missing_table_error(e, "live_otp_events"):
+                with _LIVE_EVENTS_LOCK:
+                    if not _LIVE_EVENTS_TABLE_MISSING:
+                        logger.warning(
+                            "Table 'live_otp_events' not found in Supabase; reading from 'settings' fallback."
+                        )
+                        _LIVE_EVENTS_TABLE_MISSING = True
+            else:
+                logger.error(f"get_live_receiver_events_sync error: {e}")
+                return []
+
+    with _LIVE_EVENTS_LOCK:
+        items = _read_live_events_fallback_list()
+    filtered = [ev for ev in items if float(ev.get("ts") or 0) >= cutoff]
+    filtered.sort(key=lambda ev: float(ev.get("ts") or 0), reverse=True)
+    return filtered[:safe_limit]
+
+
+def cleanup_old_live_receiver_events_sync():
+    global _LIVE_EVENTS_TABLE_MISSING
+    cutoff = time.time() - LIVE_RECEIVERS_RETENTION_SECONDS
+    if not _LIVE_EVENTS_TABLE_MISSING:
+        try:
+            supabase.table("live_otp_events").delete().lt("ts", cutoff).execute()
+        except Exception as e:
+            if _is_missing_table_error(e, "live_otp_events"):
+                with _LIVE_EVENTS_LOCK:
+                    _LIVE_EVENTS_TABLE_MISSING = True
+            else:
+                logger.error(f"cleanup_old_live_receiver_events_sync error: {e}")
+    with _LIVE_EVENTS_LOCK:
+        raw = get_setting(_LIVE_EVENTS_FALLBACK_KEY, "")
+        if raw:
+            existing = _read_live_events_fallback_list()
+            kept = [ev for ev in existing if float(ev.get("ts") or 0) >= cutoff]
+            if len(kept) != len(existing):
+                _write_live_events_fallback_list(kept)
+
+
+def _filter_live_events(filter_mode: str = "all") -> list:
+    return get_live_receiver_events_sync(filter_mode, limit=LIVE_RECEIVERS_MAX_EVENTS)
 
 
 def _truncate_text(val: str, max_len: int) -> str:
@@ -3821,12 +4104,14 @@ def build_live_receivers_view(
     filter_mode: str = "all",
     page: int = 1,
     use_premium: Optional[bool] = None,
+    events: Optional[list] = None,
 ) -> Tuple[str, InlineKeyboardMarkup]:
     premium = _is_premium_emojis_enabled(use_premium)
     if filter_mode not in ("5m", "15m", "30m", "1h", "all"):
         filter_mode = "all"
 
-    events = _filter_live_events(filter_mode)
+    if events is None:
+        events = _filter_live_events(filter_mode)
     total_events = len(events)
     unique_receivers = len({ev["user_id"] for ev in events})
 
@@ -3967,12 +4252,14 @@ def build_live_receivers_summary_view(
     filter_mode: str = "all",
     page: int = 1,
     use_premium: Optional[bool] = None,
+    events: Optional[list] = None,
 ) -> Tuple[str, InlineKeyboardMarkup]:
     premium = _is_premium_emojis_enabled(use_premium)
     if filter_mode not in ("5m", "15m", "30m", "1h", "all"):
         filter_mode = "all"
 
-    events = _filter_live_events(filter_mode)
+    if events is None:
+        events = _filter_live_events(filter_mode)
     by_user: Dict[int, dict] = {}
     for ev in events:
         uid = ev["user_id"]
@@ -4183,10 +4470,11 @@ def _decode_usr_back(tok: str) -> str:
     return "adm:usr:control"
 
 
-def build_all_users_view(sort_mode: str = "recent", page: int = 1, use_premium: Optional[bool] = None):
+def build_all_users_view(sort_mode: str = "recent", page: int = 1, use_premium: Optional[bool] = None, users: Optional[list] = None):
     if sort_mode not in ("recent", "old"):
         sort_mode = "recent"
-    users = get_users_ordered_sync(sort_mode)
+    if users is None:
+        users = get_users_ordered_sync(sort_mode)
     total = len(users)
     per_page = 25
     total_pages = max(1, (total + per_page - 1) // per_page)
@@ -4243,8 +4531,9 @@ def build_all_users_view(sort_mode: str = "recent", page: int = 1, use_premium: 
     return text, InlineKeyboardMarkup(buttons)
 
 
-def build_banned_users_view(page: int = 1, use_premium: Optional[bool] = None):
-    users = get_banned_users_list_sync()
+def build_banned_users_view(page: int = 1, use_premium: Optional[bool] = None, users: Optional[list] = None):
+    if users is None:
+        users = get_banned_users_list_sync()
     total = len(users)
     per_page = 25
     total_pages = max(1, (total + per_page - 1) // per_page)
@@ -4285,10 +4574,11 @@ def build_banned_users_view(page: int = 1, use_premium: Optional[bool] = None):
     return text, InlineKeyboardMarkup(buttons)
 
 
-def build_inactive_users_view(window: str = "7d", page: int = 1, use_premium: Optional[bool] = None):
+def build_inactive_users_view(window: str = "7d", page: int = 1, use_premium: Optional[bool] = None, users: Optional[list] = None):
     if window not in ("24h", "3d", "7d", "15d", "30d"):
         window = "7d"
-    users = get_inactive_users_list_sync(window)
+    if users is None:
+        users = get_inactive_users_list_sync(window)
     total = len(users)
     per_page = 25
     total_pages = max(1, (total + per_page - 1) // per_page)
@@ -5482,9 +5772,10 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⛔ Unauthorized! You do not have permission for Live Receivers.")
             return
         context.user_data['current_menu'] = 'admin'
+        live_events = await run_db(get_live_receiver_events_sync, "all")
         await _reply_with_emoji_fallback(
             update.message,
-            lambda prem: build_live_receivers_view("all", 1, use_premium=prem),
+            lambda prem: build_live_receivers_view("all", 1, use_premium=prem, events=live_events),
             parse_mode="HTML",
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
@@ -7302,7 +7593,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         ok, _missing = await check_user_joined_all(context.bot, user_id, chats)
         if ok:
-            _FORCE_JOIN_CACHE[user_id] = time.time()
+            now_fj = time.time()
+            if len(_FORCE_JOIN_CACHE) >= _FORCE_JOIN_CACHE_MAX:
+                _prune_ts_cache(_FORCE_JOIN_CACHE, _FORCE_JOIN_CACHE_TTL, _FORCE_JOIN_CACHE_MAX - 1, now=now_fj)
+            _FORCE_JOIN_CACHE[user_id] = now_fj
             await query.answer("✅ Verified! You can now use the bot.", show_alert=True)
             try:
                 await query.edit_message_text(
@@ -7483,9 +7777,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             page = 1
         try:
+            live_events = await run_db(get_live_receiver_events_sync, filter_mode)
             status = await _edit_with_emoji_fallback(
                 query,
-                lambda prem: build_live_receivers_view(filter_mode, page, use_premium=prem),
+                lambda prem: build_live_receivers_view(filter_mode, page, use_premium=prem, events=live_events),
                 parse_mode="HTML",
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
@@ -7503,9 +7798,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             page = 1
         try:
+            live_events = await run_db(get_live_receiver_events_sync, filter_mode)
             status = await _edit_with_emoji_fallback(
                 query,
-                lambda prem: build_live_receivers_summary_view(filter_mode, page, use_premium=prem),
+                lambda prem: build_live_receivers_summary_view(filter_mode, page, use_premium=prem, events=live_events),
                 parse_mode="HTML",
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
@@ -7541,9 +7837,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page = int(parts[4]) if len(parts) > 4 else 1
         except ValueError:
             page = 1
+        users_list = await run_db(get_users_ordered_sync, sort_mode)
         await _edit_with_emoji_fallback(
             query,
-            lambda prem: build_all_users_view(sort_mode, page, use_premium=prem),
+            lambda prem: build_all_users_view(sort_mode, page, use_premium=prem, users=users_list),
             parse_mode="Markdown",
         )
 
@@ -7555,9 +7852,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page = int(parts[3]) if len(parts) > 3 else 1
         except ValueError:
             page = 1
+        users_list = await run_db(get_banned_users_list_sync)
         await _edit_with_emoji_fallback(
             query,
-            lambda prem: build_banned_users_view(page, use_premium=prem),
+            lambda prem: build_banned_users_view(page, use_premium=prem, users=users_list),
             parse_mode="Markdown",
         )
 
@@ -7570,9 +7868,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page = int(parts[4]) if len(parts) > 4 else 1
         except ValueError:
             page = 1
+        users_list = await run_db(get_inactive_users_list_sync, win)
         await _edit_with_emoji_fallback(
             query,
-            lambda prem: build_inactive_users_view(win, page, use_premium=prem),
+            lambda prem: build_inactive_users_view(win, page, use_premium=prem, users=users_list),
             parse_mode="Markdown",
         )
 
@@ -8452,6 +8751,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     show_alert=True,
                 )
                 return
+        if len(_LAST_NUMBER_CLAIM) >= _ANTI_ABUSE_STATE_MAX:
+            _prune_ts_cache(_LAST_NUMBER_CLAIM, max(NUMBER_CLAIM_COOLDOWN * 4, 60.0), _ANTI_ABUSE_STATE_MAX - 1)
         _LAST_NUMBER_CLAIM[user_id] = time.monotonic()
 
         target_qty = int(get_setting("number_quantity", "2") or 2)
@@ -8554,6 +8855,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
+        if len(_LAST_NUMBER_CLAIM) >= _ANTI_ABUSE_STATE_MAX:
+            _prune_ts_cache(_LAST_NUMBER_CLAIM, max(NUMBER_CLAIM_COOLDOWN * 4, 60.0), _ANTI_ABUSE_STATE_MAX - 1)
         _LAST_NUMBER_CLAIM[user_id] = time.monotonic()
 
         target_qty = int(get_setting("number_quantity", "2") or 2)
@@ -8924,6 +9227,8 @@ async def process_otp_items_fast(items: list, application: Application):
     # ⚡ Build and send all messages IN PARALLEL
     # ═══════════════════════════════════════════════════════════
     send_tasks = []
+    live_events_batch = []
+    batch_ts = time.time()
     for u, data in per_user.items():
         prof = display_profiles.get(u) or {"balance": 0.0, "total_otps": 0}
         bal_str = fmt_num(prof["balance"])
@@ -8939,9 +9244,9 @@ async def process_otp_items_fast(items: list, application: Application):
 
             otp_code = extract_otp(msg)
 
-            # 📡 Record Live Receiver Event
+            # 📡 Collect Live Receiver Event for batched DB persistence
             u_ident = identities_map.get(u, {})
-            LIVE_RECEIVER_EVENTS.append({
+            live_events_batch.append({
                 "user_id": int(u),
                 "first_name": u_ident.get("first_name") or f"User {u}",
                 "username": u_ident.get("username") or "",
@@ -8950,7 +9255,7 @@ async def process_otp_items_fast(items: list, application: Application):
                 "number": num,
                 "otp_code": otp_code,
                 "payout": item_payout,
-                "ts": time.time(),
+                "ts": batch_ts,
             })
 
             safe_msg = html.escape(msg)
@@ -9059,6 +9364,14 @@ async def process_otp_items_fast(items: list, application: Application):
                     application.bot, u,
                     text=user_text, reply_markup=user_kbd, parse_mode="HTML",
                 ))
+
+    if live_events_batch:
+        async def _bg_record_live_events(batch):
+            try:
+                await run_db(record_live_receiver_events_batch_sync, batch)
+            except Exception as e:
+                logger.error(f"bg record_live_receiver_events failed: {e}")
+        asyncio.create_task(_bg_record_live_events(live_events_batch))
 
     if send_tasks:
         await asyncio.gather(*send_tasks, return_exceptions=True)
@@ -9288,11 +9601,13 @@ async def poll_single_panel(panel_id: str, application: Application,
 async def otp_poller_manager(application: Application):
     loaded = await run_db(load_seen_otp_ids_sync) or {}
     processed_ids = TimedLRUDict(maxsize=PROCESSED_IDS_MAX, ttl=OTP_ID_RETENTION_SECONDS)
-    for mid, ts in loaded.items():
+    for mid, ts in sorted(loaded.items(), key=lambda kv: float(kv[1] or 0)):
         try:
             processed_ids.add(mid, ts=float(ts) if ts else None)
         except Exception:
             processed_ids.add(mid)
+    loaded.clear()
+    await run_db(cleanup_old_live_receiver_events_sync)
     logger.info(f"OTP Poller Manager started. Loaded {len(processed_ids)} seen OTP ids.")
 
     cycle_count = 0
@@ -9321,8 +9636,12 @@ async def otp_poller_manager(application: Application):
             cycle_count += 1
             if cycle_count % CLEANUP_EVERY_N_CYCLES == 0:
                 await run_db(cleanup_old_otp_ids_sync)
+                await run_db(cleanup_old_live_receiver_events_sync)
                 try:
                     processed_ids.prune()
+                    AUGESTEL_PROCESSED_OTPS.prune()
+                    prune_runtime_caches()
+                    gc.collect()
                 except Exception as e:
                     logger.error(f"prune error: {e}")
 
