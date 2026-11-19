@@ -3530,7 +3530,7 @@ def run_flask():
     WAIT_COUNTRY_SHORT,
     WAIT_CLI_EMOJI_NAME, WAIT_CLI_EMOJI_VAL,
     WAIT_AUG_EMAIL, WAIT_AUG_PASSWORD, WAIT_AUG_API_KEY,
-) = range(55)
+) = range(56)
 
 
 def get_main_keyboard(user_id: int):
