@@ -11,7 +11,7 @@ import time
 import datetime
 import threading
 import io
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from functools import wraps
 from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import urljoin
@@ -109,6 +109,12 @@ _BROADCAST_SEND_LOCK: Optional[asyncio.Lock] = None
 _NEXT_BROADCAST_SEND_AT = 0.0
 _BOT_INFO_CACHE: Dict[str, Any] = {"username": None, "link": "https://t.me", "ts": 0.0}
 _PANEL_INFO_CACHE: Dict[str, Dict[str, Any]] = {}
+
+# 📡 LIVE OTP RECEIVERS STREAM
+LIVE_RECEIVERS_MAX_EVENTS = 500
+LIVE_RECEIVER_EVENTS: deque = deque(maxlen=LIVE_RECEIVERS_MAX_EVENTS)
+_USER_IDENTITY_CACHE: Dict[int, Dict[str, Any]] = {}
+_USER_IDENTITY_CACHE_TTL = 300.0
 
 # 🛡️ ANTI-ABUSE STATE
 _LAST_NUMBER_CLAIM: Dict[int, float] = {}
@@ -318,7 +324,7 @@ AUGESTEL_PROCESSED_OTPS = TimedLRUDict(maxsize=200000, ttl=OTP_ID_RETENTION_SECO
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Ranking|Leaderboard|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Broadcast|Extra|Manage Payouts|User Manager|Withdraw|Back)$")
+MENU_FILTER = filters.Regex("(?i)^(Get Number|Profile|Wallet|Ranking|Leaderboard|Support|Admin Panel|Services|Admin Control|Global Settings|Edit Links|Edit API|Number Quantity|Broadcast|Extra|Manage Payouts|User Manager|Live Receivers|Withdraw|Back)$")
 
 
 # ---------------- HELPERS ----------------
@@ -1273,10 +1279,10 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
         await page.wait_for_timeout(3000)
         logger.info(f"✅ Augestel Dashboard loaded for {panel_id}. Waiting for WebSocket frames...")
         
-        # Auto Refresh Mechanism (Every 3 hours)
+        # Auto Refresh Mechanism (Every 5m)
         async def periodic_refresh():
             while AUGESTEL_SESSIONS.get(str(panel_id)):
-                await asyncio.sleep(10800) # 3 hours
+                await asyncio.sleep(300) # 5m
                 logger.info(f"Refreshing Augestel Page for {panel_id}")
                 try:
                     p = AUGESTEL_SESSIONS.get(str(panel_id), {}).get("page")
@@ -1776,6 +1782,61 @@ def update_withdraw_status_sync(req_id: int, status: str, reject_reason: str = "
         logger.error(f"Supabase update withdraw status error: {e}")
 
 
+def get_user_identities_batch_sync(user_ids: list) -> Dict[int, Dict[str, str]]:
+    if not user_ids:
+        return {}
+    now = time.time()
+    result: Dict[int, Dict[str, str]] = {}
+    missing = []
+    for raw_uid in user_ids:
+        try:
+            uid = int(raw_uid)
+        except (TypeError, ValueError):
+            continue
+        cached = _USER_IDENTITY_CACHE.get(uid)
+        if cached and (now - cached.get("ts", 0.0)) < _USER_IDENTITY_CACHE_TTL:
+            result[uid] = {
+                "first_name": cached.get("first_name", ""),
+                "username": cached.get("username", ""),
+            }
+        else:
+            missing.append(uid)
+
+    if missing:
+        if len(_USER_IDENTITY_CACHE) > 10000:
+            _USER_IDENTITY_CACHE.clear()
+        try:
+            for i in range(0, len(missing), 500):
+                chunk = missing[i:i + 500]
+                try:
+                    res = supabase.table("users").select("user_id, username, first_name").in_("user_id", chunk).execute()
+                    for r in res.data or []:
+                        uid = int(r["user_id"])
+                        ident = {
+                            "first_name": str(r.get("first_name") or "").strip(),
+                            "username": str(r.get("username") or "").strip().lstrip("@"),
+                        }
+                        result[uid] = ident
+                        _USER_IDENTITY_CACHE[uid] = {**ident, "ts": now}
+                except Exception:
+                    res = supabase.table("users").select("user_id, first_name").in_("user_id", chunk).execute()
+                    for r in res.data or []:
+                        uid = int(r["user_id"])
+                        ident = {
+                            "first_name": str(r.get("first_name") or "").strip(),
+                            "username": "",
+                        }
+                        result[uid] = ident
+                        _USER_IDENTITY_CACHE[uid] = {**ident, "ts": now}
+        except Exception as e:
+            logger.error(f"get_user_identities_batch_sync error: {e}")
+
+    for uid in missing:
+        if uid not in result:
+            result[uid] = {"first_name": f"User {uid}", "username": ""}
+    return result
+
+
 def get_usernames_batch(user_ids: list) -> dict:
     if not user_ids:
         return {}
@@ -2129,6 +2190,14 @@ def add_refer_commission_sync(referrer_id: int, amount: float) -> bool:
 
 
 def save_user(user_id: int, first_name: str = "", username: str = ""):
+    clean_fname = first_name.strip() if first_name else ""
+    clean_uname = (username or "").strip().lstrip("@")
+    if clean_fname or clean_uname:
+        _USER_IDENTITY_CACHE[user_id] = {
+            "first_name": clean_fname,
+            "username": clean_uname,
+            "ts": time.time(),
+        }
     if user_id in KNOWN_USERS:
         return
     cur_date = get_bd_date_str()
@@ -2884,6 +2953,197 @@ def build_admin_control_view():
     return text, InlineKeyboardMarkup(buttons)
 
 
+def _format_relative_time(ts: float) -> str:
+    diff = max(0, int(time.time() - ts))
+    if diff < 5:
+        return "just now"
+    if diff < 60:
+        return f"{diff}s ago"
+    if diff < 3600:
+        return f"{diff // 60}m ago"
+    if diff < 86400:
+        return f"{diff // 3600}h ago"
+    return f"{diff // 86400}d ago"
+
+
+def _filter_live_events(filter_mode: str = "all") -> list:
+    snapshot = list(LIVE_RECEIVER_EVENTS)
+    snapshot.reverse()  # newest first
+    now = time.time()
+    if filter_mode == "15m":
+        cutoff = now - 900
+        return [ev for ev in snapshot if ev.get("ts", 0) >= cutoff]
+    if filter_mode == "1h":
+        cutoff = now - 3600
+        return [ev for ev in snapshot if ev.get("ts", 0) >= cutoff]
+    return snapshot
+
+
+def build_live_receivers_view(filter_mode: str = "all", page: int = 1) -> Tuple[str, InlineKeyboardMarkup]:
+    if filter_mode not in ("all", "15m", "1h"):
+        filter_mode = "all"
+
+    events = _filter_live_events(filter_mode)
+    total_events = len(events)
+    unique_receivers = len({ev["user_id"] for ev in events})
+
+    per_page = 8
+    total_pages = max(1, (total_events + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start_idx = (page - 1) * per_page
+    page_events = events[start_idx:start_idx + per_page]
+
+    filter_labels = {"all": "All Recent", "15m": "Last 15m", "1h": "Last 1h"}
+    now_bd = datetime.datetime.now(_BD_TZ).strftime("%H:%M:%S")
+
+    text = (
+        f"📡 <b>LIVE OTP RECEIVERS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔍 Filter: <b>{filter_labels[filter_mode]}</b>  •  "
+        f"📨 OTPs: <code>{total_events}</code>  •  "
+        f"👥 Active: <code>{unique_receivers}</code>\n"
+        f"🕒 Updated: <code>{now_bd}</code>  •  Page <code>{page}/{total_pages}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    if not page_events:
+        text += (
+            "\n<i>No live OTPs recorded yet for this window.</i>\n"
+            "<i>Incoming OTPs will appear here automatically as users receive them.</i>\n"
+        )
+    else:
+        for idx, ev in enumerate(page_events, start=start_idx + 1):
+            uid = ev["user_id"]
+            fname = ev.get("first_name") or f"User {uid}"
+            uname = (ev.get("username") or "").strip().lstrip("@")
+            user_link = f'<a href="tg://user?id={uid}">{html.escape(fname)}</a>'
+            uname_part = f" (@{html.escape(uname)})" if uname else ""
+
+            service = safe_html_escape(ev.get("service") or "Service")
+            country = html.escape(strip_all_emojis(ev.get("country") or "Unknown") or str(ev.get("country") or "Unknown"))
+            number = html.escape(str(ev.get("number") or ""))
+            otp_code = html.escape(str(ev.get("otp_code") or "N/A"))
+            ts = float(ev.get("ts") or time.time())
+            bd_time = datetime.datetime.fromtimestamp(ts, _BD_TZ).strftime("%H:%M:%S")
+            rel_time = _format_relative_time(ts)
+
+            text += (
+                f"\n<b>{idx}.</b> 👤 {user_link}{uname_part} • <code>{uid}</code>\n"
+                f"   🏷️ {service} • 🌍 {country}\n"
+                f"   📞 <code>{number}</code> • 🔐 <code>{otp_code}</code> • ⏱️ {rel_time} (<code>{bd_time}</code>)\n"
+            )
+
+    buttons = [
+        [
+            create_button("All" if filter_mode != "all" else "• All •", callback_data="adm:live:page:all:1", style="success" if filter_mode == "all" else "primary"),
+            create_button("15m" if filter_mode != "15m" else "• 15m •", callback_data="adm:live:page:15m:1", style="success" if filter_mode == "15m" else "primary"),
+            create_button("1h" if filter_mode != "1h" else "• 1h •", callback_data="adm:live:page:1h:1", style="success" if filter_mode == "1h" else "primary"),
+        ]
+    ]
+
+    if total_pages > 1:
+        nav_row = []
+        if page > 1:
+            nav_row.append(create_button("◀️ Prev", callback_data=f"adm:live:page:{filter_mode}:{page - 1}", style="primary"))
+        nav_row.append(create_button(f"{page}/{total_pages}", callback_data="noop", style="primary"))
+        if page < total_pages:
+            nav_row.append(create_button("Next ▶️", callback_data=f"adm:live:page:{filter_mode}:{page + 1}", style="primary"))
+        buttons.append(nav_row)
+
+    buttons.append([
+        create_button("🔄 Refresh", callback_data=f"adm:live:page:{filter_mode}:{page}", style="success"),
+        create_button("👥 Active Summary", callback_data=f"adm:live:summary:{filter_mode}:1", style="primary"),
+    ])
+    buttons.append([create_button("Back to Panel", callback_data="adm:panel_back", style="danger", icon_custom_emoji_id="5456187398977247949")])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_live_receivers_summary_view(filter_mode: str = "all", page: int = 1) -> Tuple[str, InlineKeyboardMarkup]:
+    if filter_mode not in ("all", "15m", "1h"):
+        filter_mode = "all"
+
+    events = _filter_live_events(filter_mode)
+    by_user: Dict[int, dict] = {}
+    for ev in events:
+        uid = ev["user_id"]
+        if uid not in by_user:
+            by_user[uid] = {
+                "user_id": uid,
+                "first_name": ev.get("first_name") or f"User {uid}",
+                "username": (ev.get("username") or "").strip().lstrip("@"),
+                "count": 0,
+                "last_ts": float(ev.get("ts") or 0),
+                "last_service": ev.get("service") or "Service",
+                "last_country": ev.get("country") or "Unknown",
+                "last_number": ev.get("number") or "",
+            }
+        by_user[uid]["count"] += 1
+
+    grouped = sorted(by_user.values(), key=lambda x: x["last_ts"], reverse=True)
+    total_users = len(grouped)
+    total_otps = len(events)
+
+    per_page = 10
+    total_pages = max(1, (total_users + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start_idx = (page - 1) * per_page
+    page_items = grouped[start_idx:start_idx + per_page]
+
+    filter_labels = {"all": "All Recent", "15m": "Last 15m", "1h": "Last 1h"}
+    now_bd = datetime.datetime.now(_BD_TZ).strftime("%H:%M:%S")
+
+    text = (
+        f"👥 <b>ACTIVE LIVE RECEIVERS SUMMARY</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔍 Filter: <b>{filter_labels[filter_mode]}</b>  •  "
+        f"👥 Users: <code>{total_users}</code>  •  "
+        f"📨 OTPs: <code>{total_otps}</code>\n"
+        f"🕒 Updated: <code>{now_bd}</code>  •  Page <code>{page}/{total_pages}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    if not page_items:
+        text += "\n<i>No active receivers found for this time window.</i>\n"
+    else:
+        for idx, rec in enumerate(page_items, start=start_idx + 1):
+            uid = rec["user_id"]
+            user_link = f'<a href="tg://user?id={uid}">{html.escape(rec["first_name"])}</a>'
+            uname_part = f" (@{html.escape(rec['username'])})" if rec["username"] else ""
+            service = safe_html_escape(rec["last_service"])
+            country = html.escape(strip_all_emojis(rec["last_country"]) or str(rec["last_country"]))
+            number = html.escape(str(rec["last_number"]))
+            rel_time = _format_relative_time(rec["last_ts"])
+
+            text += (
+                f"\n<b>{idx}.</b> {user_link}{uname_part} • <code>{uid}</code> — <b>{rec['count']} OTP(s)</b>\n"
+                f"   └ Last: {service} • {country} • <code>{number}</code> ({rel_time})\n"
+            )
+
+    buttons = [
+        [
+            create_button("All" if filter_mode != "all" else "• All •", callback_data="adm:live:summary:all:1", style="success" if filter_mode == "all" else "primary"),
+            create_button("15m" if filter_mode != "15m" else "• 15m •", callback_data="adm:live:summary:15m:1", style="success" if filter_mode == "15m" else "primary"),
+            create_button("1h" if filter_mode != "1h" else "• 1h •", callback_data="adm:live:summary:1h:1", style="success" if filter_mode == "1h" else "primary"),
+        ]
+    ]
+
+    if total_pages > 1:
+        nav_row = []
+        if page > 1:
+            nav_row.append(create_button("◀️ Prev", callback_data=f"adm:live:summary:{filter_mode}:{page - 1}", style="primary"))
+        nav_row.append(create_button(f"{page}/{total_pages}", callback_data="noop", style="primary"))
+        if page < total_pages:
+            nav_row.append(create_button("Next ▶️", callback_data=f"adm:live:summary:{filter_mode}:{page + 1}", style="primary"))
+        buttons.append(nav_row)
+
+    buttons.append([
+        create_button("🔄 Refresh", callback_data=f"adm:live:summary:{filter_mode}:{page}", style="success"),
+        create_button("📡 Live Stream", callback_data=f"adm:live:page:{filter_mode}:1", style="primary"),
+    ])
+    buttons.append([create_button("Back to Panel", callback_data="adm:panel_back", style="danger", icon_custom_emoji_id="5456187398977247949")])
+    return text, InlineKeyboardMarkup(buttons)
+
+
 def build_user_manager_view():
     text = "👥 **USER MANAGER**\n\nManage users, search for specific user details, view global statistics, or export the entire database."
     buttons = [
@@ -3611,6 +3871,7 @@ def get_admin_keyboard():
         [KeyboardButton("Services", icon_custom_emoji_id="5258096772776991776", style="success"), KeyboardButton("Broadcast", icon_custom_emoji_id="5800920921766104807", style="success")],
         [KeyboardButton("Admin Control", icon_custom_emoji_id="5258508428212445001", style="primary"), KeyboardButton("Global Settings", icon_custom_emoji_id="5258096772776991776", style="primary")],
         [KeyboardButton("User Manager", icon_custom_emoji_id="6307589808424228455", style="primary"), KeyboardButton("Manage Payouts", icon_custom_emoji_id="5417924076503062111", style="primary")],
+        [KeyboardButton("Live Receivers", icon_custom_emoji_id="5352877703043258544", style="success")],
         [KeyboardButton("Back", icon_custom_emoji_id="5456187398977247949", style="danger")]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
@@ -3791,6 +4052,14 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['current_menu'] = 'admin'
         text_msg, kbd = build_user_manager_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif text_upper == "LIVE RECEIVERS" and user_is_admin:
+        context.user_data['current_menu'] = 'admin'
+        text_msg, kbd = build_live_receivers_view("all", 1)
+        await update.message.reply_text(
+            text_msg, reply_markup=kbd, parse_mode="HTML",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
 
     elif text_upper == "GLOBAL SETTINGS" and user_is_admin:
         context.user_data['current_menu'] = 'global_settings'
@@ -5409,6 +5678,48 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_admin_keyboard(), parse_mode="Markdown"
         )
 
+    elif data.startswith("adm:live:page:"):
+        if not user_is_admin: await query.answer(); return
+        parts = data.split(":", 4)
+        filter_mode = parts[3] if len(parts) > 3 else "all"
+        try:
+            page = int(parts[4]) if len(parts) > 4 else 1
+        except ValueError:
+            page = 1
+        text_msg, kbd = build_live_receivers_view(filter_mode, page)
+        try:
+            await query.edit_message_text(
+                text_msg, reply_markup=kbd, parse_mode="HTML",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+            await query.answer("Updated!")
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                await query.answer("Already up to date!")
+            else:
+                await query.answer()
+
+    elif data.startswith("adm:live:summary:"):
+        if not user_is_admin: await query.answer(); return
+        parts = data.split(":", 4)
+        filter_mode = parts[3] if len(parts) > 3 else "all"
+        try:
+            page = int(parts[4]) if len(parts) > 4 else 1
+        except ValueError:
+            page = 1
+        text_msg, kbd = build_live_receivers_summary_view(filter_mode, page)
+        try:
+            await query.edit_message_text(
+                text_msg, reply_markup=kbd, parse_mode="HTML",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+            await query.answer("Updated!")
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                await query.answer("Already up to date!")
+            else:
+                await query.answer()
+
     elif data == "adm:usr:manager":
         if not user_is_admin: await query.answer(); return
         await query.answer()
@@ -6408,12 +6719,18 @@ async def process_otp_items_fast(items: list, application: Application):
         except Exception:
             return (uid, {"balance": 0.0, "total_otps": 0})
 
+    identities_task = asyncio.create_task(run_db(get_user_identities_batch_sync, list(per_user.keys())))
+
     parallel_tasks = []
     if missing_pairs:
         parallel_tasks.extend([run_db(get_payout_sync, s, c) for (s, c) in missing_pairs])
     parallel_tasks.extend([_fetch_profile(uid) for uid in per_user.keys()])
 
     results = await asyncio.gather(*parallel_tasks, return_exceptions=True)
+    try:
+        identities_map = await identities_task
+    except Exception:
+        identities_map = {}
 
     old_profiles: Dict[int, dict] = {}
     offset = len(missing_pairs) if missing_pairs else 0
@@ -6477,6 +6794,21 @@ async def process_otp_items_fast(items: list, application: Application):
             full_country = alloc.get("country", "Unknown")
 
             otp_code = extract_otp(msg)
+
+            # 📡 Record Live Receiver Event
+            u_ident = identities_map.get(u, {})
+            LIVE_RECEIVER_EVENTS.append({
+                "user_id": int(u),
+                "first_name": u_ident.get("first_name") or f"User {u}",
+                "username": u_ident.get("username") or "",
+                "service": display_service,
+                "country": full_country,
+                "number": num,
+                "otp_code": otp_code,
+                "payout": item_payout,
+                "ts": time.time(),
+            })
+
             safe_msg = html.escape(msg)
             safe_service = safe_html_escape(display_service)
             safe_short = safe_html_escape(short_country)
