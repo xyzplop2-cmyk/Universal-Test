@@ -4103,48 +4103,51 @@ def build_extra_settings_view():
     show_msg = get_setting("show_message", "true") == "true"
     show_country_count = get_setting("show_country_count", "false") == "true"
     show_dev = get_setting("show_developer", "true") == "true"
-    withdraw_on = get_setting("withdraw_enabled", "true") == "true"
-    ranking_bonus_on = get_setting("ranking_bonus_enabled", "true") == "true"
-    force_join_on = is_force_join_enabled()
-    refer_on = get_setting("refer_enabled", "true") == "true"
-    refer_pct = get_setting("refer_commission_percent", "5")
     otp_format = get_setting("otp_group_format", "regular")
     premium_on = (otp_format == "premium")
 
     msg_status = "ENABLED 🟢" if show_msg else "DISABLED 🔴"
     count_status = "ENABLED 🟢" if show_country_count else "DISABLED 🔴"
     dev_status = "ENABLED 🟢" if show_dev else "DISABLED 🔴"
-    withdraw_status = "ENABLED 🟢" if withdraw_on else "DISABLED 🔴"
-    ranking_status = "ENABLED 🟢" if ranking_bonus_on else "DISABLED 🔴"
-    fj_status = "ENABLED 🟢" if force_join_on else "DISABLED 🔴"
-    refer_status = "ENABLED 🟢" if refer_on else "DISABLED 🔴"
     otp_format_label = "PREMIUM (Table) 🟢" if premium_on else "REGULAR 🔴"
 
     text = (
         "⚙️ **EXTRA SETTINGS**\n\n"
-        f"📩 **Show OTP Message:** `{msg_status}`\n"
-        f"🔢 **Show Country Number Count:** `{count_status}`\n"
-        f"👨‍💻 **Show Developer Info:** `{dev_status}`\n"
-        f"💸 **Withdraw System:** `{withdraw_status}`\n"
-        f"🏆 **Ranking Bonus System:** `{ranking_status}`\n"
-        f"🚪 **Force Join System:** `{fj_status}`\n"
-        f"🎁 **Refer System:** `{refer_status}` (Commission: `{refer_pct}%`)\n"
-        f"📨 **OTP Group Format:** `{otp_format_label}`\n\n"
-        "Use the buttons below to enable/disable or configure options."
+        "Select an option to toggle or configure:"
     )
     buttons = [
         [create_button(f"Show Message: {msg_status}", callback_data="adm:toggle:show_msg", style="success" if show_msg else "danger", icon_custom_emoji_id="5258096772776991776")],
-        [create_button(f"Country Count: {count_status}", callback_data="adm:toggle:country_count", style="success" if show_country_count else "danger", icon_custom_emoji_id="5258096772776991776")],
+        [create_button(f"Number Count: {count_status}", callback_data="adm:toggle:country_count", style="success" if show_country_count else "danger", icon_custom_emoji_id="5258096772776991776")],
         [create_button(f"Show Developer: {dev_status}", callback_data="adm:toggle:show_dev", style="success" if show_dev else "danger", icon_custom_emoji_id="5258096772776991776")],
-        [create_button(f"Withdraw System: {withdraw_status}", callback_data="adm:toggle:withdraw", style="success" if withdraw_on else "danger", icon_custom_emoji_id="5258096772776991776")],
-        [create_button(f"Ranking Bonus: {ranking_status}", callback_data="adm:toggle:ranking_bonus", style="success" if ranking_bonus_on else "danger", icon_custom_emoji_id="5258096772776991776")],
-        [create_button("Force Join Settings", callback_data="adm:fj_settings", style="primary", icon_custom_emoji_id="5258096772776991776")],
-        [create_button(f"Refer System: {refer_status}", callback_data="adm:toggle:refer", style="success" if refer_on else "danger", icon_custom_emoji_id="5258096772776991776")],
-        [create_button(f"Refer Commission: {refer_pct}%", callback_data="adm:refer_set_pct", style="primary", icon_custom_emoji_id="5258096772776991776")],
         [create_button(f"OTP Group Format: {otp_format_label}", callback_data="adm:toggle:otp_format", style="success" if premium_on else "danger", icon_custom_emoji_id="5258096772776991776")],
-        [create_button("Withdraw Settings", callback_data="adm:w_settings", style="primary", icon_custom_emoji_id="5258096772776991776"),
-         create_button("Ranking Bonuses", callback_data="adm:r_bonus_settings", style="primary", icon_custom_emoji_id="5258096772776991776")],
-        [create_button("CLI Emojis", callback_data="adm:cliemoji:list", style="primary", icon_custom_emoji_id="5258096772776991776")]
+        [
+            create_button("Refer System", callback_data="adm:refer_settings", style="primary", icon_custom_emoji_id="5258096772776991776"),
+            create_button("Force Join Settings", callback_data="adm:fj_settings", style="primary", icon_custom_emoji_id="5258096772776991776"),
+        ],
+        [
+            create_button("Withdraw Settings", callback_data="adm:w_settings", style="primary", icon_custom_emoji_id="5258096772776991776"),
+            create_button("Ranking Bonuses", callback_data="adm:r_bonus_settings", style="primary", icon_custom_emoji_id="5258096772776991776"),
+        ],
+        [create_button("CLI Emojis", callback_data="adm:cliemoji:list", style="primary", icon_custom_emoji_id="5258096772776991776")],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_refer_settings_view():
+    refer_on = get_setting("refer_enabled", "true") == "true"
+    refer_pct = get_setting("refer_commission_percent", "5")
+    refer_status = "ENABLED 🟢" if refer_on else "DISABLED 🔴"
+
+    text = (
+        "🎁 **REFER SYSTEM SETTINGS**\n\n"
+        f"📌 **Status:** `{refer_status}`\n"
+        f"💰 **Commission:** `{refer_pct}%`\n\n"
+        "Enable/disable the referral system or update the commission percentage below."
+    )
+    buttons = [
+        [create_button(f"Refer System: {refer_status}", callback_data="adm:toggle:refer", style="success" if refer_on else "danger", icon_custom_emoji_id="5258096772776991776")],
+        [create_button(f"Edit Commission ({refer_pct}%)", callback_data="adm:refer_set_pct", style="primary", icon_custom_emoji_id="5370604433233177619")],
+        [create_button("Back", callback_data="adm:extra_back", style="danger", icon_custom_emoji_id="5456187398977247949")],
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -4236,6 +4239,7 @@ def build_ranking_bonus_settings_view():
         f"🥉 **Top 3 Bonus:** `{b3} ৳`\n"
     )
     buttons = [
+        [create_button(f"Ranking Bonus: {status_str}", callback_data="adm:toggle:ranking_bonus", style="success" if bonus_enabled else "danger", icon_custom_emoji_id="5258096772776991776")],
         [create_button("Edit Top 1 Bonus", callback_data="adm:r_set_b1", style="primary", icon_custom_emoji_id="5370604433233177619")],
         [create_button("Edit Top 2 Bonus", callback_data="adm:r_set_b2", style="primary", icon_custom_emoji_id="5370604433233177619")],
         [create_button("Edit Top 3 Bonus", callback_data="adm:r_set_b3", style="primary", icon_custom_emoji_id="5370604433233177619")],
@@ -4245,11 +4249,14 @@ def build_ranking_bonus_settings_view():
 
 
 def build_withdraw_settings_view():
+    withdraw_on = get_setting("withdraw_enabled", "true") == "true"
+    withdraw_status = "ENABLED 🟢" if withdraw_on else "DISABLED 🔴"
     min_w = get_setting("min_withdraw_amount", "50")
     methods = get_withdraw_methods_sync()
 
     text = (
         "💳 **WITHDRAW SETTINGS**\n\n"
+        f"📌 **Status:** `{withdraw_status}`\n"
         f"💰 **Minimum Withdraw Amount:** `{min_w} ৳`\n\n"
         "📌 **Active Payment Methods:**\n"
     )
@@ -4260,6 +4267,7 @@ def build_withdraw_settings_view():
         text += "No active payment methods.\n"
 
     buttons = [
+        [create_button(f"Withdraw System: {withdraw_status}", callback_data="adm:toggle:withdraw", style="success" if withdraw_on else "danger", icon_custom_emoji_id="5258096772776991776")],
         [create_button("Add Method", callback_data="adm:w_add_m", style="success", icon_custom_emoji_id="5287354223141342798"),
          create_button("Remove Method", callback_data="adm:w_del_m_list", style="danger", icon_custom_emoji_id="6267000941547885720")],
         [create_button("Edit Min Amount", callback_data="adm:w_set_min", style="primary", icon_custom_emoji_id="5370604433233177619")],
@@ -6168,6 +6176,7 @@ async def handle_fj_chat_type(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 @admin_only
 async def admin_set_refer_pct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
     await update.callback_query.message.reply_text(
         "Enter refer commission percentage (e.g., 5 for 5%):\n"
         "Send a number between 0 and 100.\n"
@@ -6186,7 +6195,7 @@ async def receive_refer_pct(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAIT_REFER_PERCENT
     await run_db(set_setting, "refer_commission_percent", str(val))
     await update.message.reply_text(f"✅ Refer commission set to `{fmt_num(val)}%`!", parse_mode="Markdown")
-    text_msg, kbd = build_extra_settings_view()
+    text_msg, kbd = build_refer_settings_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
@@ -6481,6 +6490,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user_is_admin: await query.answer(); return
         await query.answer()
         text_msg, kbd = build_ranking_bonus_settings_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data == "adm:refer_settings":
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        text_msg, kbd = build_refer_settings_view()
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif data == "adm:extra_back":
@@ -6812,7 +6827,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user_is_admin: await query.answer(); return
         setting_map = {
             "adm:toggle:show_msg": ("show_message", "true", "Show Message"),
-            "adm:toggle:country_count": ("show_country_count", "false", "Country number count"),
+            "adm:toggle:country_count": ("show_country_count", "false", "Number Count"),
             "adm:toggle:show_dev": ("show_developer", "true", "Developer Info"),
             "adm:toggle:withdraw": ("withdraw_enabled", "true", "Withdraw system"),
             "adm:toggle:ranking_bonus": ("ranking_bonus_enabled", "true", "Ranking Bonus"),
@@ -6824,7 +6839,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await run_db(set_setting, key, new_val)
         status_text = "enabled" if new_val == "true" else "disabled"
         await query.answer(f"{label} is now {status_text}!", show_alert=True)
-        text_msg, kbd = build_extra_settings_view()
+        if data == "adm:toggle:withdraw":
+            text_msg, kbd = build_withdraw_settings_view()
+        elif data == "adm:toggle:ranking_bonus":
+            text_msg, kbd = build_ranking_bonus_settings_view()
+        elif data == "adm:toggle:refer":
+            text_msg, kbd = build_refer_settings_view()
+        else:
+            text_msg, kbd = build_extra_settings_view()
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif data == "adm:toggle:otp_format":
