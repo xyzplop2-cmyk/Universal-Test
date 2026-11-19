@@ -123,7 +123,6 @@ CAPTCHA_SESSIONS: Dict[str, dict] = {}
 CAPTCHA_PANEL_STATUS: Dict[str, str] = {}
 AUGESTEL_SESSIONS: Dict[str, dict] = {}
 AUGESTEL_PANEL_STATUS: Dict[str, str] = {}
-AUGESTEL_PROCESSED_OTPS = TimedLRUDict(maxsize=200000, ttl=OTP_ID_RETENTION_SECOND
 AUGESTEL_LOGIN_URL = "https://augestel.com/Switchfy"
 AUGESTEL_DASHBOARD_URL = "https://augestel.com/Switchfy/client/live-sms"
 AUGESTEL_TERMINATIONS_PATH = "/Switchfy/client/sms-statistics/terminations"
@@ -313,6 +312,8 @@ class TimedLRUDict:
 
 KNOWN_USERS = LRUSet(maxsize=MAX_KNOWN_USERS)
 LEADERBOARD_CACHE = {"data": None, "ts": 0}
+
+AUGESTEL_PROCESSED_OTPS = TimedLRUDict(maxsize=200000, ttl=OTP_ID_RETENTION_SECONDS) 
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
