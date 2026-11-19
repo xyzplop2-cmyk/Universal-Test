@@ -1238,43 +1238,23 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
         )
         context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 800},
         )
         
-        # ✅ Single page creation (bug fix)
-        page = await context.new_page()
-        
-        # ✅ Single WebSocket listener registration (bug fix — no double-fire)
         context.on("websocket", lambda ws: _augestel_ws_listener(ws, str(panel_id)))
+
+        page = await context.new_page()
+        page.on("websocket", lambda ws: _augestel_ws_listener(ws, str(panel_id)))
         
-        # ── Login flow ──
         await page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(4000)
         
-        email_input = (
-            page.get_by_placeholder("you@company.com")
-            .or_(page.get_by_label("Email address"))
-            .or_(page.locator("input:visible").nth(0))
-            .first
-        )
-        password_input = (
-            page.locator('input[type="password"]:visible')
-            .or_(page.get_by_label("Password"))
-            .first
-        )
+        email_input = page.get_by_placeholder("you@company.com").or_(page.get_by_label("Email address")).or_(page.locator("input:visible").nth(0)).first
+        password_input = page.locator('input[type="password"]:visible').or_(page.get_by_label("Password")).first
         
         await email_input.wait_for(state="visible", timeout=30000)
         await email_input.fill(email)
@@ -1292,18 +1272,17 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
         logger.info(f"✅ Augestel Dashboard loaded for {panel_id}. Waiting for WebSocket frames...")
         
         # ============================================================
-        # 🧠 SMART ADAPTIVE RELOAD — Fully traffic/DOM dependent
+        # 🧠 SMART ADAPTIVE RELOAD — Traffic/DOM-row based, crashproof
         # ============================================================
         async def periodic_refresh():
-            ROW_LIMIT = 100              # DOM rows cross করলে reload
-            MAX_AGE = 3 * 3600           # Slow traffic safety (3h max)
-            CHECK_INTERVAL = 60          # প্রতি 1 মিনিটে চেক
-            
+            ROW_LIMIT = 100                # DOM row cross হলে reload (high traffic)
+            MAX_AGE = 3 * 3600             # Slow traffic এ সর্বোচ্চ 3h
+            CHECK_INTERVAL = 60            # প্রতি 60s চেক
             last_reload = time.time()
+            
             logger.info(
                 f"🧠 Smart reload active for {panel_id} "
-                f"(row_limit={ROW_LIMIT}, max_age={MAX_AGE//3600}h, "
-                f"check={CHECK_INTERVAL}s)"
+                f"(row_limit={ROW_LIMIT}, max_age={MAX_AGE//3600}h, check={CHECK_INTERVAL}s)"
             )
             
             while AUGESTEL_SESSIONS.get(str(panel_id)):
@@ -1319,16 +1298,18 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
                         break
                     
                     # ── Session dead check ──
-                    current_url = (p.url or "").lower()
+                    try:
+                        current_url = (p.url or "").lower()
+                    except Exception:
+                        current_url = ""
                     if "login" in current_url or "signin" in current_url:
                         logger.warning(f"⚠️ Session expired {panel_id}, forcing re-login")
                         await _augestel_close_session(panel_id)
                         break
                     
-                    # ── Row count (all tables in DOM) ──
+                    # ── DOM row count (সব tbody এর মোট tr) ──
                     try:
-                        row_count = await p.evaluate(
-                            """
+                        row_count = await p.evaluate("""
                             () => {
                                 let c = 0;
                                 document.querySelectorAll('table tbody').forEach(t => {
@@ -1336,15 +1317,14 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
                                 });
                                 return c;
                             }
-                            """
-                        )
+                        """)
                     except Exception:
                         row_count = 0
                     
                     now = time.time()
                     age = now - last_reload
                     
-                    # ── Reload decision (traffic-dependent) ──
+                    # ── Reload decision ──
                     should_reload = False
                     reason = ""
                     
@@ -1360,28 +1340,36 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
                             f"🔄 Smart reload {panel_id}: {reason}, "
                             f"rows={row_count}, age={int(age/60)}min"
                         )
-                        await p.reload(wait_until="domcontentloaded", timeout=30000)
-                        await p.wait_for_timeout(3000)
+                        try:
+                            await p.reload(wait_until="domcontentloaded", timeout=30000)
+                            await p.wait_for_timeout(3000)
+                        except Exception as re:
+                            logger.error(f"Reload failed {panel_id}: {re}")
+                            continue
+                        
                         last_reload = time.time()
                         
-                        # Session re-check after reload
-                        if "login" in (p.url or "").lower():
-                            logger.warning(f"⚠️ Session expired after reload {panel_id}")
-                            await _augestel_close_session(panel_id)
-                            break
-                            
+                        # Post-reload session check
+                        try:
+                            if "login" in (p.url or "").lower():
+                                logger.warning(f"⚠️ Session expired after reload {panel_id}")
+                                await _augestel_close_session(panel_id)
+                                break
+                        except Exception:
+                            pass
+                        
                 except Exception as e:
                     logger.error(f"Smart reload error {panel_id}: {e}")
-        
+                    
         asyncio.create_task(periodic_refresh())
         
-        # ── Queue for unified processing ──
+        # Queue for unified processing
         otp_queue = asyncio.Queue()
         ws_event = asyncio.Event()
         state = {
             "queue": otp_queue,
             "ws_event": ws_event,
-            "raw_items_queue": otp_queue,
+            "raw_items_queue": otp_queue
         }
         
         AUGESTEL_SESSIONS[str(panel_id)] = {
@@ -1393,21 +1381,17 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
             "last_login": time.time(),
         }
         
-        # ── API Poller as Backup ──
+        # Start the API Poller as Backup
         if api_key:
             p_interval = panel.get("polling_interval", 13.0)
-            asyncio.create_task(
-                _augestel_api_poller(str(panel_id), api_key, p_interval, state)
-            )
+            asyncio.create_task(_augestel_api_poller(str(panel_id), api_key, p_interval, state))
             
         return True, "Active & Fetching (WS + API)"
         
     except Exception as e:
         try:
-            if browser:
-                await browser.close()
-            if pw:
-                await pw.stop()
+            if browser: await browser.close()
+            if pw: await pw.stop()
         except Exception:
             pass
         return False, f"Error: {str(e)[:80]}"
