@@ -413,6 +413,10 @@ def strip_all_emojis(text: str) -> str:
     return remove_emojis(t).strip()
 
 
+_SC_CB_CACHE: Dict[str, Tuple[str, str]] = {}
+_SRV_CB_CACHE: Dict[str, str] = {}
+
+
 def _cb_clean(name: str) -> str:
     """Clean name for callback_data (removes tg-emoji to fit 64-byte limit)."""
     if not name:
@@ -426,6 +430,58 @@ def _resolve_full_key(clean: str, keys) -> str:
         if _cb_clean(k) == clean:
             return k
     return clean
+
+
+def _make_srv_token(service: str) -> str:
+    clean = _cb_clean(service)
+    if clean and len(clean.encode("utf-8")) <= 44 and not clean.startswith("#"):
+        return clean
+    h = hashlib.md5(str(service).encode("utf-8")).hexdigest()[:10]
+    if len(_SRV_CB_CACHE) > 2000:
+        _SRV_CB_CACHE.clear()
+    _SRV_CB_CACHE[h] = service
+    return f"#{h}"
+
+
+def _resolve_srv_token(token: str) -> str:
+    if token.startswith("#"):
+        key = token[1:]
+        if key in _SRV_CB_CACHE:
+            return _SRV_CB_CACHE[key]
+        for s in SERVICES_CACHE.keys():
+            if hashlib.md5(str(s).encode("utf-8")).hexdigest()[:10] == key:
+                return s
+    return _resolve_full_key(token, list(SERVICES_CACHE.keys()))
+
+
+def _make_sc_token(service: str, country: str) -> str:
+    s_clean = _cb_clean(service)
+    c_clean = _cb_clean(country)
+    combined = f"{s_clean}:{c_clean}"
+    if s_clean and c_clean and ":" not in s_clean and len(combined.encode("utf-8")) <= 44 and not s_clean.startswith("#"):
+        return combined
+    h = hashlib.md5(f"{service}\x00{country}".encode("utf-8")).hexdigest()[:10]
+    if len(_SC_CB_CACHE) > 5000:
+        _SC_CB_CACHE.clear()
+    _SC_CB_CACHE[h] = (service, country)
+    return f"#{h}"
+
+
+def _resolve_sc_token(token: str) -> Tuple[str, str]:
+    if token.startswith("#"):
+        key = token[1:]
+        if key in _SC_CB_CACHE:
+            return _SC_CB_CACHE[key]
+        for s, cnts in SERVICES_CACHE.items():
+            for c in cnts.keys():
+                if hashlib.md5(f"{s}\x00{c}".encode("utf-8")).hexdigest()[:10] == key:
+                    return s, c
+    if ":" in token:
+        s_tok, c_tok = token.split(":", 1)
+        service = _resolve_full_key(s_tok, list(SERVICES_CACHE.keys()))
+        country = _resolve_full_key(c_tok, list(SERVICES_CACHE.get(service, {}).keys()))
+        return service, country
+    return token, ""
         
 def clean_tg_link(val: str) -> str:
     if not val:
@@ -2834,13 +2890,30 @@ def get_admin_services_summary():
     return SERVICES_CACHE
 
 
+def _delete_setting_key_sync(key: str):
+    SETTINGS_CACHE.pop(key, None)
+    try:
+        supabase.table("settings").delete().eq("key", key).execute()
+    except Exception as e:
+        logger.warning(f"delete setting {key} error: {e}")
+    if firebase_db_ref:
+        try:
+            firebase_db_ref.reference(f"settings/{key}").delete()
+        except Exception:
+            pass
+
+
 def delete_service_db(service: str):
+    cnts = list(SERVICES_CACHE.get(service, {}).keys())
     try:
         supabase.table("services").delete().eq("service_name", service).execute()
         supabase.table("numbers").delete().eq("service", service).execute()
         supabase.table("payouts").delete().eq("service_name", service).execute()
     except Exception as e:
         logger.error(f"Supabase delete service error: {e}")
+    for cnt in cnts:
+        _delete_setting_key_sync(f"country_short:{service}:{cnt}")
+        _delete_setting_key_sync(f"cc_len:{service}:{cnt}")
     if firebase_db_ref:
         try:
             firebase_db_ref.reference(f"services/{service}").delete()
@@ -2859,6 +2932,8 @@ def delete_country_db(service: str, country: str):
         supabase.table("payouts").delete().eq("service_name", service).eq("country_name", country).execute()
     except Exception as e:
         logger.error(f"Supabase delete country error: {e}")
+    _delete_setting_key_sync(f"country_short:{service}:{country}")
+    _delete_setting_key_sync(f"cc_len:{service}:{country}")
     if firebase_db_ref:
         try:
             firebase_db_ref.reference(f"services/{service}/{country}").delete()
@@ -2868,6 +2943,95 @@ def delete_country_db(service: str, country: str):
             logger.error(f"Firebase delete country error: {e}")
     refresh_services_cache_sync()
     refresh_payouts_cache_sync()
+
+
+def rename_service_db(old_service: str, new_service: str) -> Tuple[bool, str]:
+    old_service = (old_service or "").strip()
+    new_service = (new_service or "").strip()
+    if not old_service or not new_service:
+        return False, "Service name cannot be empty."
+    if old_service == new_service:
+        return True, "No change."
+    if new_service in SERVICES_CACHE:
+        return False, f"Service '{_cb_clean(new_service)}' already exists."
+
+    cnts = list(SERVICES_CACHE.get(old_service, {}).keys())
+    try:
+        supabase.table("services").update({"service_name": new_service}).eq("service_name", old_service).execute()
+        supabase.table("numbers").update({"service": new_service}).eq("service", old_service).execute()
+        supabase.table("payouts").update({"service_name": new_service}).eq("service_name", old_service).execute()
+        supabase.table("allocations").update({"service": new_service}).eq("service", old_service).execute()
+    except Exception as e:
+        logger.error(f"Supabase rename_service_db error: {e}")
+        return False, f"Database error: {e}"
+
+    for cnt in cnts:
+        old_short_key = f"country_short:{old_service}:{cnt}"
+        if old_short_key in SETTINGS_CACHE:
+            set_setting(f"country_short:{new_service}:{cnt}", SETTINGS_CACHE[old_short_key])
+            _delete_setting_key_sync(old_short_key)
+        old_cc_key = f"cc_len:{old_service}:{cnt}"
+        if old_cc_key in SETTINGS_CACHE:
+            set_setting(f"cc_len:{new_service}:{cnt}", SETTINGS_CACHE[old_cc_key])
+            _delete_setting_key_sync(old_cc_key)
+
+    if firebase_db_ref:
+        try:
+            for root in ("services", "numbers", "payouts"):
+                val = firebase_db_ref.reference(f"{root}/{old_service}").get()
+                if val is not None:
+                    firebase_db_ref.reference(f"{root}/{new_service}").set(val)
+                    firebase_db_ref.reference(f"{root}/{old_service}").delete()
+        except Exception as e:
+            logger.warning(f"Firebase rename_service_db error: {e}")
+
+    refresh_services_cache_sync()
+    refresh_payouts_cache_sync()
+    return True, "Renamed"
+
+
+def rename_country_db(service: str, old_country: str, new_country: str) -> Tuple[bool, str]:
+    service = (service or "").strip()
+    old_country = (old_country or "").strip()
+    new_country = (new_country or "").strip()
+    if not service or not old_country or not new_country:
+        return False, "Country name cannot be empty."
+    if old_country == new_country:
+        return True, "No change."
+    if new_country in SERVICES_CACHE.get(service, {}):
+        return False, f"Country '{_cb_clean(new_country)}' already exists in this service."
+
+    try:
+        supabase.table("services").update({"country_name": new_country}).eq("service_name", service).eq("country_name", old_country).execute()
+        supabase.table("numbers").update({"country": new_country}).eq("service", service).eq("country", old_country).execute()
+        supabase.table("payouts").update({"country_name": new_country}).eq("service_name", service).eq("country_name", old_country).execute()
+        supabase.table("allocations").update({"country": new_country}).eq("service", service).eq("country", old_country).execute()
+    except Exception as e:
+        logger.error(f"Supabase rename_country_db error: {e}")
+        return False, f"Database error: {e}"
+
+    old_short_key = f"country_short:{service}:{old_country}"
+    if old_short_key in SETTINGS_CACHE:
+        set_setting(f"country_short:{service}:{new_country}", SETTINGS_CACHE[old_short_key])
+        _delete_setting_key_sync(old_short_key)
+    old_cc_key = f"cc_len:{service}:{old_country}"
+    if old_cc_key in SETTINGS_CACHE:
+        set_setting(f"cc_len:{service}:{new_country}", SETTINGS_CACHE[old_cc_key])
+        _delete_setting_key_sync(old_cc_key)
+
+    if firebase_db_ref:
+        try:
+            for root in ("services", "numbers", "payouts"):
+                val = firebase_db_ref.reference(f"{root}/{service}/{old_country}").get()
+                if val is not None:
+                    firebase_db_ref.reference(f"{root}/{service}/{new_country}").set(val)
+                    firebase_db_ref.reference(f"{root}/{service}/{old_country}").delete()
+        except Exception as e:
+            logger.warning(f"Firebase rename_country_db error: {e}")
+
+    refresh_services_cache_sync()
+    refresh_payouts_cache_sync()
+    return True, "Renamed"
 
 
 def get_countries_for_service(service: str) -> list:
@@ -3083,11 +3247,6 @@ def build_admin_control_view(use_premium: Optional[bool] = None):
     buttons.append([
         _admin_inline_btn(
             "Back to User Manager", callback_data="adm:usr:manager",
-            style="primary", emoji_id="5456187398977247949",
-            fallback_emoji="◀️", use_premium=use_premium,
-        ),
-        _admin_inline_btn(
-            "Back to Panel", callback_data="adm:panel_back",
             style="danger", emoji_id="5456187398977247949",
             fallback_emoji="◀️", use_premium=use_premium,
         ),
@@ -3117,6 +3276,9 @@ def _filter_live_events(filter_mode: str = "all") -> list:
         return [ev for ev in snapshot if ev.get("ts", 0) >= cutoff]
     if filter_mode == "15m":
         cutoff = now - 900
+        return [ev for ev in snapshot if ev.get("ts", 0) >= cutoff]
+    if filter_mode == "30m":
+        cutoff = now - 1800
         return [ev for ev in snapshot if ev.get("ts", 0) >= cutoff]
     if filter_mode == "1h":
         cutoff = now - 3600
@@ -3148,7 +3310,7 @@ def build_live_receivers_view(
     use_premium: Optional[bool] = None,
 ) -> Tuple[str, InlineKeyboardMarkup]:
     premium = _is_premium_emojis_enabled(use_premium)
-    if filter_mode not in ("5m", "15m", "1h", "all"):
+    if filter_mode not in ("5m", "15m", "30m", "1h", "all"):
         filter_mode = "all"
 
     events = _filter_live_events(filter_mode)
@@ -3164,6 +3326,7 @@ def build_live_receivers_view(
     filter_labels = {
         "5m": "Last 5m",
         "15m": "Last 15m",
+        "30m": "Last 30m",
         "1h": "Last 1h",
         "all": "All Recent",
     }
@@ -3222,20 +3385,43 @@ def build_live_receivers_view(
             text += entry
             plain_len += entry_plain_len
 
-    filter_row = []
-    for mode, lbl in (("5m", "5m"), ("15m", "15m"), ("1h", "1h"), ("all", "All")):
+    def _fbtn(mode: str, lbl: str):
         is_active = (filter_mode == mode)
         btn_text = f"• {lbl} •" if is_active else lbl
-        filter_row.append(_admin_inline_btn(
+        return _admin_inline_btn(
             btn_text,
             callback_data=f"adm:live:page:{mode}:1",
             style="success" if is_active else "primary",
             emoji_id="5472239203590888751" if mode != "all" else "5352922460897452503",
             fallback_emoji="⏱️" if mode != "all" else "🔍",
             use_premium=premium,
-        ))
+        )
 
-    buttons = [filter_row]
+    buttons = [
+        [_fbtn("5m", "5m"), _fbtn("15m", "15m"), _fbtn("30m", "30m")],
+        [
+            _fbtn("1h", "1h"),
+            _fbtn("all", "All"),
+            _admin_inline_btn(
+                "Refresh",
+                callback_data=f"adm:live:page:{filter_mode}:{page}",
+                style="success",
+                emoji_id="5244758760429213978",
+                fallback_emoji="🔄",
+                use_premium=premium,
+            ),
+        ],
+        [
+            _admin_inline_btn(
+                "Active Summary",
+                callback_data=f"adm:live:summary:{filter_mode}:1",
+                style="primary",
+                emoji_id="6307589808424228455",
+                fallback_emoji="👥",
+                use_premium=premium,
+            ),
+        ],
+    ]
 
     if total_pages > 1:
         nav_row = []
@@ -3261,34 +3447,6 @@ def build_live_receivers_view(
             ))
         buttons.append(nav_row)
 
-    buttons.append([
-        _admin_inline_btn(
-            "Refresh",
-            callback_data=f"adm:live:page:{filter_mode}:{page}",
-            style="success",
-            emoji_id="5244758760429213978",
-            fallback_emoji="🔄",
-            use_premium=premium,
-        ),
-        _admin_inline_btn(
-            "Active Summary",
-            callback_data=f"adm:live:summary:{filter_mode}:1",
-            style="primary",
-            emoji_id="6307589808424228455",
-            fallback_emoji="👥",
-            use_premium=premium,
-        ),
-    ])
-    buttons.append([
-        _admin_inline_btn(
-            "Back to Panel",
-            callback_data="adm:panel_back",
-            style="danger",
-            emoji_id="5456187398977247949",
-            fallback_emoji="◀️",
-            use_premium=premium,
-        )
-    ])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -3298,7 +3456,7 @@ def build_live_receivers_summary_view(
     use_premium: Optional[bool] = None,
 ) -> Tuple[str, InlineKeyboardMarkup]:
     premium = _is_premium_emojis_enabled(use_premium)
-    if filter_mode not in ("5m", "15m", "1h", "all"):
+    if filter_mode not in ("5m", "15m", "30m", "1h", "all"):
         filter_mode = "all"
 
     events = _filter_live_events(filter_mode)
@@ -3331,6 +3489,7 @@ def build_live_receivers_summary_view(
     filter_labels = {
         "5m": "Last 5m",
         "15m": "Last 15m",
+        "30m": "Last 30m",
         "1h": "Last 1h",
         "all": "All Recent",
     }
@@ -3378,20 +3537,43 @@ def build_live_receivers_summary_view(
             text += entry
             plain_len += entry_plain_len
 
-    filter_row = []
-    for mode, lbl in (("5m", "5m"), ("15m", "15m"), ("1h", "1h"), ("all", "All")):
+    def _fbtn(mode: str, lbl: str):
         is_active = (filter_mode == mode)
         btn_text = f"• {lbl} •" if is_active else lbl
-        filter_row.append(_admin_inline_btn(
+        return _admin_inline_btn(
             btn_text,
             callback_data=f"adm:live:summary:{mode}:1",
             style="success" if is_active else "primary",
             emoji_id="5472239203590888751" if mode != "all" else "5352922460897452503",
             fallback_emoji="⏱️" if mode != "all" else "🔍",
             use_premium=premium,
-        ))
+        )
 
-    buttons = [filter_row]
+    buttons = [
+        [_fbtn("5m", "5m"), _fbtn("15m", "15m"), _fbtn("30m", "30m")],
+        [
+            _fbtn("1h", "1h"),
+            _fbtn("all", "All"),
+            _admin_inline_btn(
+                "Refresh",
+                callback_data=f"adm:live:summary:{filter_mode}:{page}",
+                style="success",
+                emoji_id="5244758760429213978",
+                fallback_emoji="🔄",
+                use_premium=premium,
+            ),
+        ],
+        [
+            _admin_inline_btn(
+                "Live Stream",
+                callback_data=f"adm:live:page:{filter_mode}:1",
+                style="primary",
+                emoji_id="5352877703043258544",
+                fallback_emoji="📡",
+                use_premium=premium,
+            ),
+        ],
+    ]
 
     if total_pages > 1:
         nav_row = []
@@ -3417,34 +3599,6 @@ def build_live_receivers_summary_view(
             ))
         buttons.append(nav_row)
 
-    buttons.append([
-        _admin_inline_btn(
-            "Refresh",
-            callback_data=f"adm:live:summary:{filter_mode}:{page}",
-            style="success",
-            emoji_id="5244758760429213978",
-            fallback_emoji="🔄",
-            use_premium=premium,
-        ),
-        _admin_inline_btn(
-            "Live Stream",
-            callback_data=f"adm:live:page:{filter_mode}:1",
-            style="primary",
-            emoji_id="5352877703043258544",
-            fallback_emoji="📡",
-            use_premium=premium,
-        ),
-    ])
-    buttons.append([
-        _admin_inline_btn(
-            "Back to Panel",
-            callback_data="adm:panel_back",
-            style="danger",
-            emoji_id="5456187398977247949",
-            fallback_emoji="◀️",
-            use_premium=premium,
-        )
-    ])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -3508,7 +3662,8 @@ def build_admin_services_view():
         for cnt, count in cnts.items():
             payout = get_payout_sync(srv, cnt)
             text += f"\n   └ {safe_html_escape(cnt)}: <code>{count}</code> avail | payout <code>{fmt_num(payout)}৳</code>"
-        buttons.append([create_button(srv, callback_data=f"adm:srv:view:{_cb_clean(srv)}", style="primary", icon_custom_emoji_id="5258096772776991776")])
+        srv_tok = _make_srv_token(srv)
+        buttons.append([create_button(srv, callback_data=f"adm:srv:view:{srv_tok}", style="primary", icon_custom_emoji_id="5258096772776991776")])
 
     buttons.append([create_button("Add New Service / Numbers", callback_data="adm:srv:add", style="success", icon_custom_emoji_id="5287354223141342798")])
     return text, InlineKeyboardMarkup(buttons)
@@ -3518,6 +3673,7 @@ def build_service_manage_view(service: str):
     summary = get_admin_services_summary()
     cnts = summary.get(service, {})
     total_avail = sum(cnts.values())
+    srv_tok = _make_srv_token(service)
 
     text = f"⚙️ <b>SERVICE DETAILS: {safe_html_escape(service)}</b>\n\n"
     text += f"📊 Total Available Numbers: <code>{total_avail}</code>\n\n"
@@ -3530,16 +3686,94 @@ def build_service_manage_view(service: str):
     else:
         text += "No countries configured.\n"
 
-    buttons = [
-        [create_button("Add Country / Numbers", callback_data=f"adm:srv:add:{_cb_clean(service)}", style="success", icon_custom_emoji_id="5287354223141342798")],
-    ]
-    if cnts:
-        buttons.append([create_button("Manage Payouts", callback_data=f"adm:pay:mng:{_cb_clean(service)}", style="primary", icon_custom_emoji_id="5417924076503062111")])
-    buttons.append([create_button("Delete Service", callback_data=f"adm:srv:del:{_cb_clean(service)}", style="danger", icon_custom_emoji_id="5422557736330106570")])
-    if cnts:
-        buttons.append([create_button("Delete Country", callback_data=f"adm:cnt:delli:{_cb_clean(service)}", style="danger", icon_custom_emoji_id="5422557736330106570")])
+    buttons = []
+    for cnt, count in cnts.items():
+        sc_tok = _make_sc_token(service, cnt)
+        buttons.append([create_button(
+            f"{cnt} ({count})",
+            callback_data=f"adm:c:v:{sc_tok}",
+            style="primary",
+            icon_custom_emoji_id="5375177250553487549",
+        )])
+
+    buttons.append([create_button(
+        "Add Country",
+        callback_data=f"adm:srv:add:{srv_tok}",
+        style="success",
+        icon_custom_emoji_id="5287354223141342798",
+    )])
+    buttons.append([
+        create_button("Edit Service", callback_data=f"adm:srv:edit:{srv_tok}", style="primary", icon_custom_emoji_id="5370604433233177619"),
+        create_button("Delete Service", callback_data=f"adm:srv:delconf:{srv_tok}", style="danger", icon_custom_emoji_id="5422557736330106570"),
+    ])
     buttons.append([create_button("Back to Services", callback_data="adm:srv:list", style="danger", icon_custom_emoji_id="5456187398977247949")])
 
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_country_manage_view(service: str, country: str):
+    summary = get_admin_services_summary()
+    cnts = summary.get(service, {})
+    avail = cnts.get(country, 0)
+    payout = get_payout_sync(service, country)
+    short = get_country_short_sync(service, country)
+    cc_len = get_setting(f"cc_len:{service}:{country}", "0")
+
+    srv_tok = _make_srv_token(service)
+    sc_tok = _make_sc_token(service, country)
+
+    text = (
+        f"🏳️ <b>COUNTRY DETAILS</b>\n\n"
+        f"🏷️ <b>Service:</b> {safe_html_escape(service)}\n"
+        f"🌍 <b>Country:</b> {safe_html_escape(country)}\n"
+        f"🔤 <b>Short Name:</b> <code>{safe_html_escape(short)}</code>\n"
+        f"📞 <b>Available Numbers:</b> <code>{avail}</code>\n"
+        f"💰 <b>Payout:</b> <code>{fmt_num(payout)} ৳</code>\n"
+        f"🔢 <b>Country Code Digit:</b> <code>{html.escape(str(cc_len))}</code>"
+    )
+
+    buttons = [
+        [create_button("Add Numbers", callback_data=f"adm:c:an:{sc_tok}", style="success", icon_custom_emoji_id="5287354223141342798")],
+        [
+            create_button("Edit", callback_data=f"adm:c:ed:{sc_tok}", style="primary", icon_custom_emoji_id="5370604433233177619"),
+            create_button("Delete Country", callback_data=f"adm:c:dc:{sc_tok}", style="danger", icon_custom_emoji_id="5422557736330106570"),
+        ],
+        [create_button("Back", callback_data=f"adm:srv:view:{srv_tok}", style="danger", icon_custom_emoji_id="5456187398977247949")],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_country_edit_view(service: str, country: str):
+    payout = get_payout_sync(service, country)
+    short = get_country_short_sync(service, country)
+    cc_len = str(get_setting(f"cc_len:{service}:{country}", "0")).strip()
+    sc_tok = _make_sc_token(service, country)
+
+    text = (
+        f"✏️ <b>EDIT COUNTRY</b>\n\n"
+        f"🏷️ <b>Service:</b> {safe_html_escape(service)}\n"
+        f"🌍 <b>Country Name:</b> {safe_html_escape(country)}\n"
+        f"🔤 <b>Short Name:</b> <code>{safe_html_escape(short)}</code>\n"
+        f"💰 <b>Payout:</b> <code>{fmt_num(payout)} ৳</code>\n"
+        f"🔢 <b>Country Code Digit:</b> <code>{html.escape(cc_len)}</code>\n\n"
+        f"Select what you want to edit:"
+    )
+
+    cc_row = []
+    for d in ("2", "3", "4"):
+        is_sel = (cc_len == d)
+        cc_row.append(create_button(
+            f"• CC: {d} •" if is_sel else f"CC: {d}",
+            callback_data=f"adm:c:cc:{d}:{sc_tok}",
+            style="success" if is_sel else "primary",
+        ))
+
+    buttons = [
+        [create_button("Edit Name & Short", callback_data=f"adm:c:en:{sc_tok}", style="primary", icon_custom_emoji_id="5370604433233177619")],
+        [create_button("Edit Payout", callback_data=f"adm:c:ep:{sc_tok}", style="primary", icon_custom_emoji_id="5417924076503062111")],
+        cc_row,
+        [create_button("Back", callback_data=f"adm:c:v:{sc_tok}", style="danger", icon_custom_emoji_id="5456187398977247949")],
+    ]
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -4151,7 +4385,8 @@ def run_flask():
     WAIT_COUNTRY_SHORT,
     WAIT_CLI_EMOJI_NAME, WAIT_CLI_EMOJI_VAL,
     WAIT_AUG_EMAIL, WAIT_AUG_PASSWORD, WAIT_AUG_API_KEY,
-) = range(56)
+    WAIT_EDIT_SERVICE_NAME, WAIT_EDIT_COUNTRY_NAME, WAIT_EDIT_COUNTRY_SHORT,
+) = range(59)
 
 
 def get_main_keyboard(user_id: int):
@@ -4251,7 +4486,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'cpt_login_url', 'cpt_username', 'cpt_password', 'cpt_msg_link',
                 'cpt_num_col_name', 'cpt_num_col_idx', 'cpt_msg_col_name',
                 'fj_chat_id', 'fj_chat_title', 'fj_chat_link', 'cc_length', 'aug_email', 'aug_password',
-                'country_short'):
+                'country_short', 'edit_old_service', 'edit_srv', 'edit_old_country',
+                'edit_new_country', 'add_numbers_return_country'):
         context.user_data.pop(key, None)
 
     context.user_data['current_menu'] = 'main'
@@ -4630,7 +4866,7 @@ async def receive_payout_amount(update: Update, context: ContextTypes.DEFAULT_TY
 
     flow = context.user_data.get('pay_flow')
 
-    if flow == 'edit':
+    if flow in ('edit', 'country_edit'):
         service = context.user_data.get('pay_edit_service')
         country = context.user_data.get('pay_edit_country')
         await run_db(set_payout_sync, service, country, val)
@@ -4639,7 +4875,10 @@ async def receive_payout_amount(update: Update, context: ContextTypes.DEFAULT_TY
             f"<b>{safe_html_escape(country)}</b> set to <code>{fmt_num(val)} ৳</code>!",
             parse_mode="HTML"
         )
-        text_msg, kbd = build_payout_manage_view(service)
+        if flow == 'country_edit':
+            text_msg, kbd = build_country_edit_view(service, country)
+        else:
+            text_msg, kbd = build_payout_manage_view(service)
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="HTML")
         for key in ('pay_flow', 'pay_edit_service', 'pay_edit_country'):
             context.user_data.pop(key, None)
@@ -4928,13 +5167,180 @@ async def admin_add_service_start(update: Update, context: ContextTypes.DEFAULT_
 @admin_only
 async def admin_add_service_with_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    service = _resolve_full_key(query.data.split(":", 3)[3], list(SERVICES_CACHE.keys()))
+    service = _resolve_srv_token(query.data.split(":", 3)[3])
     context.user_data['service_name'] = service
     await query.message.reply_text(
         f"Service <b>{safe_html_escape(service)}</b> selected.\n\nEnter country name (e.g., Bangladesh, Nepal):",
         parse_mode="HTML"
     )
     return ADD_COUNTRY
+
+
+@admin_only
+async def admin_edit_service_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    service = _resolve_srv_token(query.data.split(":", 3)[3])
+    context.user_data['edit_old_service'] = service
+    await query.message.reply_text(
+        f"✏️ <b>EDIT SERVICE NAME</b>\n\n"
+        f"Current name: <b>{safe_html_escape(service)}</b>\n\n"
+        f"Send the new service name (supports premium emojis), or type /cancel to abort:",
+        parse_mode="HTML",
+    )
+    return WAIT_EDIT_SERVICE_NAME
+
+
+async def receive_edit_service_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text or ""
+    ents = update.message.entities or []
+    new_service = entities_to_tg_emoji(raw, ents).strip()
+    old_service = context.user_data.get('edit_old_service')
+
+    if not old_service or not new_service:
+        await update.message.reply_text("❌ Service name cannot be empty. Please try again or type /cancel:")
+        return WAIT_EDIT_SERVICE_NAME
+
+    ok, err = await run_db(rename_service_db, old_service, new_service)
+    if not ok:
+        await update.message.reply_text(f"❌ {html.escape(err)}\nPlease enter another name or type /cancel:", parse_mode="HTML")
+        return WAIT_EDIT_SERVICE_NAME
+
+    context.user_data.pop('edit_old_service', None)
+    await update.message.reply_text(
+        f"✅ Service renamed to <b>{safe_html_escape(new_service)}</b>!",
+        parse_mode="HTML",
+    )
+    text_msg, kbd = build_service_manage_view(new_service)
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="HTML")
+    return ConversationHandler.END
+
+
+@admin_only
+async def admin_country_add_numbers_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    service, country = _resolve_sc_token(query.data.split(":", 3)[3])
+    context.user_data['service_name'] = service
+    context.user_data['country_name'] = country
+    context.user_data['payout_amount'] = get_payout_sync(service, country)
+    context.user_data['add_numbers_return_country'] = True
+    await query.message.reply_text(
+        f"➕ <b>ADD NUMBERS</b>\n\n"
+        f"🏷️ Service: <b>{safe_html_escape(service)}</b>\n"
+        f"🏳️ Country: <b>{safe_html_escape(country)}</b>\n\n"
+        f"Send the numbers (as a text file or one number per line):",
+        parse_mode="HTML",
+    )
+    return ADD_NUMBERS
+
+
+@admin_only
+async def admin_edit_country_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    service, country = _resolve_sc_token(query.data.split(":", 3)[3])
+    context.user_data['edit_srv'] = service
+    context.user_data['edit_old_country'] = country
+    await query.message.reply_text(
+        f"✏️ <b>EDIT COUNTRY NAME</b>\n\n"
+        f"🏷️ Service: <b>{safe_html_escape(service)}</b>\n"
+        f"🌍 Current Country Name: <b>{safe_html_escape(country)}</b>\n\n"
+        f"Send the new <b>Country Name</b> (supports emojis), or send <code>skip</code> to keep current name:",
+        parse_mode="HTML",
+    )
+    return WAIT_EDIT_COUNTRY_NAME
+
+
+async def receive_edit_country_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text or ""
+    ents = update.message.entities or []
+    val = entities_to_tg_emoji(raw, ents).strip()
+    service = context.user_data.get('edit_srv', '')
+    old_country = context.user_data.get('edit_old_country', '')
+
+    if not service or not old_country:
+        return ConversationHandler.END
+
+    if val.lower() == "skip" or not val:
+        new_country = old_country
+    else:
+        if val != old_country and val in SERVICES_CACHE.get(service, {}):
+            await update.message.reply_text(
+                f"❌ Country <b>{safe_html_escape(val)}</b> already exists in this service.\n"
+                f"Enter another name, send <code>skip</code>, or type /cancel:",
+                parse_mode="HTML",
+            )
+            return WAIT_EDIT_COUNTRY_NAME
+        new_country = val
+
+    context.user_data['edit_new_country'] = new_country
+    curr_short = get_country_short_sync(service, old_country)
+    await update.message.reply_text(
+        f"🔤 Current Short Name: <code>{safe_html_escape(curr_short)}</code>\n\n"
+        f"Enter the new <b>Short Name</b> (e.g., <code>BD</code>, <code>US</code>, <code>LK</code>), "
+        f"or send <code>skip</code> to keep current:",
+        parse_mode="HTML",
+    )
+    return WAIT_EDIT_COUNTRY_SHORT
+
+
+async def receive_edit_country_short(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text or ""
+    ents = update.message.entities or []
+    val = entities_to_tg_emoji(raw, ents).strip()
+
+    service = context.user_data.get('edit_srv', '')
+    old_country = context.user_data.get('edit_old_country', '')
+    new_country = context.user_data.get('edit_new_country', old_country)
+
+    if not service or not old_country:
+        return ConversationHandler.END
+
+    final_country = old_country
+    if new_country != old_country:
+        ok, err = await run_db(rename_country_db, service, old_country, new_country)
+        if not ok:
+            await update.message.reply_text(f"❌ {html.escape(err)}", parse_mode="HTML")
+            for k in ('edit_srv', 'edit_old_country', 'edit_new_country'):
+                context.user_data.pop(k, None)
+            return ConversationHandler.END
+        final_country = new_country
+
+    if val.lower() != "skip" and val:
+        await run_db(set_country_short_sync, service, final_country, val)
+
+    for k in ('edit_srv', 'edit_old_country', 'edit_new_country'):
+        context.user_data.pop(k, None)
+
+    await update.message.reply_text(
+        f"✅ Updated country <b>{safe_html_escape(final_country)}</b>!",
+        parse_mode="HTML",
+    )
+    text_msg, kbd = build_country_edit_view(service, final_country)
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="HTML")
+    return ConversationHandler.END
+
+
+@admin_only
+async def admin_country_edit_payout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    service, country = _resolve_sc_token(query.data.split(":", 3)[3])
+    context.user_data['pay_edit_service'] = service
+    context.user_data['pay_edit_country'] = country
+    context.user_data['pay_flow'] = 'country_edit'
+
+    curr = get_payout_sync(service, country)
+    await query.message.reply_text(
+        f"💰 Editing payout for:\n"
+        f"🏷️ Service: <b>{safe_html_escape(service)}</b>\n"
+        f"🏳️ Country: <b>{safe_html_escape(country)}</b>\n\n"
+        f"Current payout: <code>{fmt_num(curr)} ৳</code>\n"
+        f"Send new amount (or send <code>default</code> for {fmt_num(DEFAULT_PAYOUT)} ৳):",
+        parse_mode="HTML",
+    )
+    return WAIT_PAYOUT_AMOUNT
 
 
 async def receive_service_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5015,6 +5421,7 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     service = context.user_data.get('service_name')
     country = context.user_data.get('country_name')
     payout = context.user_data.get('payout_amount', DEFAULT_PAYOUT)
+    return_country = bool(context.user_data.get('add_numbers_return_country'))
 
     if service and country and numbers:
         valid_count = await run_db(save_numbers_sync, service, country, numbers, payout)
@@ -5025,10 +5432,13 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 Payout per OTP: <code>{fmt_num(payout)} ৳</code>",
             reply_markup=get_admin_keyboard(), parse_mode="HTML"
         )
+        if return_country:
+            text_msg, kbd = build_country_manage_view(service, country)
+            await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="HTML")
     else:
         await update.message.reply_text("Incomplete data provided. Please try again.", reply_markup=get_admin_keyboard())
 
-    for key in ('service_name', 'country_name', 'payout_amount', 'cc_length', 'country_short'):
+    for key in ('service_name', 'country_name', 'payout_amount', 'cc_length', 'country_short', 'add_numbers_return_country'):
         context.user_data.pop(key, None)
     context.user_data['current_menu'] = 'admin'
     return ConversationHandler.END
@@ -5839,7 +6249,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'cpt_num_col_name', 'cpt_num_col_idx', 'cpt_msg_col_name',
                 'cpt_msg_col_idx', 'cpt_dt_col_name', 'cpt_dt_col_idx',
                 'fj_chat_id', 'fj_chat_title', 'fj_chat_link', 'cc_length', 'aug_email', 'aug_password',
-                'country_short'):
+                'country_short', 'edit_old_service', 'edit_srv', 'edit_old_country',
+                'edit_new_country', 'add_numbers_return_country'):
         context.user_data.pop(key, None)
 
     if update.message and update.message.text:
@@ -6335,27 +6746,99 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("adm:srv:view:"):
         if not user_is_admin: await query.answer(); return
         await query.answer()
-        service = _resolve_full_key(data.split(":", 3)[3], list(SERVICES_CACHE.keys()))
+        service = _resolve_srv_token(data.split(":", 3)[3])
         text, kbd = await run_db(build_service_manage_view, service)
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
 
+    elif data.startswith("adm:srv:delconf:"):
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        service = _resolve_srv_token(data.split(":", 3)[3])
+        srv_tok = _make_srv_token(service)
+        kbd = InlineKeyboardMarkup([
+            [
+                create_button("Yes, Delete", callback_data=f"adm:srv:del:{srv_tok}", style="danger", icon_custom_emoji_id="5422557736330106570"),
+                create_button("Cancel", callback_data=f"adm:srv:view:{srv_tok}", style="primary", icon_custom_emoji_id="5456187398977247949"),
+            ]
+        ])
+        await query.edit_message_text(
+            f"⚠️ <b>CONFIRM DELETE SERVICE</b>\n\n"
+            f"Are you sure you want to delete service <b>{safe_html_escape(service)}</b> and all of its countries and numbers?",
+            reply_markup=kbd, parse_mode="HTML",
+        )
+
     elif data.startswith("adm:srv:del:"):
         if not user_is_admin: await query.answer(); return
-        service = _resolve_full_key(data.split(":", 3)[3], list(SERVICES_CACHE.keys()))
+        service = _resolve_srv_token(data.split(":", 3)[3])
         await run_db(delete_service_db, service)
-        await query.answer(f"Deleted!", show_alert=True)
+        await query.answer("Service deleted!", show_alert=True)
         text, kbd = build_admin_services_view()
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
+
+    elif data.startswith("adm:c:v:"):
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        service, country = _resolve_sc_token(data.split(":", 3)[3])
+        text, kbd = await run_db(build_country_manage_view, service, country)
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
+
+    elif data.startswith("adm:c:ed:"):
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        service, country = _resolve_sc_token(data.split(":", 3)[3])
+        text, kbd = await run_db(build_country_edit_view, service, country)
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
+
+    elif data.startswith("adm:c:cc:"):
+        if not user_is_admin: await query.answer(); return
+        parts = data.split(":", 4)
+        if len(parts) >= 5:
+            cc_digit = parts[3]
+            service, country = _resolve_sc_token(parts[4])
+            await run_db(set_setting, f"cc_len:{service}:{country}", cc_digit)
+            await query.answer(f"Country Code Digit set to {cc_digit}!", show_alert=True)
+            text, kbd = build_country_edit_view(service, country)
+            try:
+                await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
+            except Exception:
+                pass
+        else:
+            await query.answer()
+
+    elif data.startswith("adm:c:dc:"):
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        service, country = _resolve_sc_token(data.split(":", 3)[3])
+        sc_tok = _make_sc_token(service, country)
+        kbd = InlineKeyboardMarkup([
+            [
+                create_button("Yes, Delete", callback_data=f"adm:c:dl:{sc_tok}", style="danger", icon_custom_emoji_id="5422557736330106570"),
+                create_button("Cancel", callback_data=f"adm:c:v:{sc_tok}", style="primary", icon_custom_emoji_id="5456187398977247949"),
+            ]
+        ])
+        await query.edit_message_text(
+            f"⚠️ <b>CONFIRM DELETE COUNTRY</b>\n\n"
+            f"Are you sure you want to delete <b>{safe_html_escape(country)}</b> from <b>{safe_html_escape(service)}</b> and all of its numbers?",
+            reply_markup=kbd, parse_mode="HTML",
+        )
+
+    elif data.startswith("adm:c:dl:"):
+        if not user_is_admin: await query.answer(); return
+        service, country = _resolve_sc_token(data.split(":", 3)[3])
+        await run_db(delete_country_db, service, country)
+        await query.answer("Country deleted!", show_alert=True)
+        text, kbd = build_service_manage_view(service)
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
 
     elif data.startswith("adm:cnt:delli:"):
         if not user_is_admin: await query.answer(); return
         await query.answer()
-        service = _resolve_full_key(data.split(":", 3)[3], list(SERVICES_CACHE.keys()))
+        service = _resolve_srv_token(data.split(":", 3)[3])
         cnts = get_admin_services_summary().get(service, {})
         buttons = []
         for cnt in cnts.keys():
             buttons.append([create_button(f"Delete {cnt}", callback_data=f"adm:cnt:del:{_cb_clean(service)}:{_cb_clean(cnt)}", style="danger", icon_custom_emoji_id="5422557736330106570")])
-        buttons.append([create_button("Back", callback_data=f"adm:srv:view:{_cb_clean(service)}", style="danger", icon_custom_emoji_id="5456187398977247949")])
+        buttons.append([create_button("Back", callback_data=f"adm:srv:view:{_make_srv_token(service)}", style="danger", icon_custom_emoji_id="5456187398977247949")])
         await query.edit_message_text(
             f"Select country to delete from <b>{safe_html_escape(service)}</b>:",
             reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML"
@@ -6377,7 +6860,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("adm:pay:mng:"):
         if not user_is_admin: await query.answer(); return
         await query.answer()
-        service = _resolve_full_key(data.split(":", 3)[3], list(SERVICES_CACHE.keys()))
+        service = _resolve_srv_token(data.split(":", 3)[3])
         text, kbd = await run_db(build_payout_manage_view, service)
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
 
@@ -7598,6 +8081,10 @@ def main():
         entry_points=[
             CallbackQueryHandler(admin_add_service_start, pattern="^adm:srv:add$"),
             CallbackQueryHandler(admin_add_service_with_name, pattern="^adm:srv:add:"),
+            CallbackQueryHandler(admin_edit_service_start, pattern="^adm:srv:edit:"),
+            CallbackQueryHandler(admin_country_add_numbers_start, pattern="^adm:c:an:"),
+            CallbackQueryHandler(admin_edit_country_name_start, pattern="^adm:c:en:"),
+            CallbackQueryHandler(admin_country_edit_payout_start, pattern="^adm:c:ep:"),
             CallbackQueryHandler(admin_add_panel_start, pattern="^adm:api:add$"),
             CallbackQueryHandler(admin_add_custom_panel_start, pattern="^adm:api:add_custom$"),
             CallbackQueryHandler(admin_add_captcha_panel_start, pattern="^adm:api:add_captcha$"),
@@ -7681,6 +8168,9 @@ def main():
             WAIT_AUG_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_aug_password)],
             WAIT_AUG_API_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_aug_api_key)],
             WAIT_CLI_EMOJI_VAL: [MessageHandler(~filters.COMMAND & ~MENU_FILTER, receive_cli_emoji_val)],
+            WAIT_EDIT_SERVICE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_edit_service_name)],
+            WAIT_EDIT_COUNTRY_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_edit_country_name)],
+            WAIT_EDIT_COUNTRY_SHORT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_edit_country_short)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
