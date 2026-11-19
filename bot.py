@@ -1067,9 +1067,11 @@ async def _process_hybrid_item(panel_id: str, item: dict, context_holder: dict):
     # Deduplication Check
     otp_hash = _make_otp_hash(num, msg, dt)
     if otp_hash in AUGESTEL_PROCESSED_OTPS:
+        logger.info(f"[{source}] Duplicate skipped: {num} | {dt}")
         return # Already processed (either via WS or API)
     
     AUGESTEL_PROCESSED_OTPS.add(otp_hash)
+    logger.info(f"[{source}] New OTP Captured: {num} | {dt} | CLI: {cli}")
     
     # Prepare item for the main OTP processor
     final_item = {
@@ -1079,6 +1081,7 @@ async def _process_hybrid_item(panel_id: str, item: dict, context_holder: dict):
         "payout": payout,
         "cli": cli,
         "panel_id": panel_id,
+        "source": source,
     }
     
     # Push to queue (which the main bot loop reads)
@@ -1088,6 +1091,7 @@ async def _process_hybrid_item(panel_id: str, item: dict, context_holder: dict):
 
 async def _augestel_ws_listener(ws, panel_id: str): # 👈 panel_id যোগ করা হলো
     """Listens to live-sms websocket payload"""
+    logger.info(f"🔗 WebSocket Connected for panel {panel_id} | URL: {ws.url}")
     async def on_message(payload):
         try:
             text = payload if isinstance(payload, str) else payload.decode('utf-8')
@@ -1116,7 +1120,7 @@ async def _augestel_ws_listener(ws, panel_id: str): # 👈 panel_id যোগ �
             
             # Fixed Context Holder
             ctx = AUGESTEL_SESSIONS.get(str(panel_id), {}).get("state", {})
-            await _process_hybrid_item(str(panel_id), item, ctx)
+            await _process_hybrid_item(str(panel_id), item, ctx, source="WS")
             
         except Exception as e:
             logger.error(f"WS Parse Error: {e}")
@@ -1160,7 +1164,7 @@ async def _augestel_api_poller(panel_id: str, api_key: str, interval: float, ctx
                                 "cli": str(msg.get("source", "")),
                                 "payout": str(msg.get("rate", "1"))
                             }
-                            await _process_hybrid_item(str(panel_id), item, ctx_holder)
+                            await _process_hybrid_item(str(panel_id), item, ctx_holder, source="API")
                             
         except Exception as e:
             logger.error(f"API Poller Error: {e}")
@@ -1206,7 +1210,7 @@ async def _augestel_close_session(panel_id: str):
                 pass
     except Exception:
         pass
-    
+
 async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, str]:
     if not HAS_PLAYWRIGHT_LIB:
         return False, "Playwright not installed"
@@ -6620,6 +6624,7 @@ async def poll_single_panel(panel_id: str, application: Application,
                 if items:
                     new_items, new_ids = _filter_new_items(items, processed_ids)
                     if new_items:
+                        sources = ", ".join(set(i.get("source", "Unknown") for i in new_items))
                         logger.info(f"Augestel Panel {panel_id}: {len(new_items)} new items - delivering")
                         try:
                             await run_db(mark_otp_seen_batch_sync, new_ids)
