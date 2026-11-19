@@ -123,6 +123,7 @@ CAPTCHA_SESSIONS: Dict[str, dict] = {}
 CAPTCHA_PANEL_STATUS: Dict[str, str] = {}
 AUGESTEL_SESSIONS: Dict[str, dict] = {}
 AUGESTEL_PANEL_STATUS: Dict[str, str] = {}
+AUGESTEL_PROCESSED_OTPS = TimedLRUDict(maxsize=200000, ttl=OTP_ID_RETENTION_SECOND
 AUGESTEL_LOGIN_URL = "https://augestel.com/Switchfy"
 AUGESTEL_DASHBOARD_URL = "https://augestel.com/Switchfy/client/live-sms"
 AUGESTEL_TERMINATIONS_PATH = "/Switchfy/client/sms-statistics/terminations"
@@ -1046,9 +1047,9 @@ async def fetch_captcha_panel_data(panel_id: str, cfg: dict) -> Tuple[list, str]
 
 def _make_otp_hash(number: str, msg: str, dt: str) -> str:
     """Creates a unique hash for deduplication"""
-    # Clean dt to only digits (removes spaces, -, :, T, Z)
-    clean_dt = re.sub(r'\D', '', str(dt))
-    raw = f"{number}|{msg[:100]}|{clean_dt}"
+    # Clean dt to only digits (YYYYMMDDHHMMSS)
+    clean_dt = re.sub(r'\D', '', str(dt))[:14] # 👈 [:14] যোগ করা হলো
+    raw = f"{number}|{msg.strip()[:100]}|{clean_dt}"
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
 async def _process_hybrid_item(panel_id: str, item: dict, context_holder: dict):
@@ -1084,14 +1085,13 @@ async def _process_hybrid_item(panel_id: str, item: dict, context_holder: dict):
     if queue:
         await queue.put(final_item)
 
-async def _augestel_ws_listener(ws):
+async def _augestel_ws_listener(ws, panel_id: str): # 👈 panel_id যোগ করা হলো
     """Listens to live-sms websocket payload"""
     async def on_message(payload):
         try:
             text = payload if isinstance(payload, str) else payload.decode('utf-8')
             data = json.loads(text)
             
-            # Filter for new_message type only
             if data.get("type") != "new_message":
                 return
                 
@@ -1113,9 +1113,8 @@ async def _augestel_ws_listener(ws):
                 "payout": sell_rate,
             }
             
-            # Call processor
-            panel_id = getattr(ws, "_panel_id", None)
-            ctx = AUGESTEL_SESSIONS.get(str(panel_id), {})
+            # Fixed Context Holder
+            ctx = AUGESTEL_SESSIONS.get(str(panel_id), {}).get("state", {})
             await _process_hybrid_item(str(panel_id), item, ctx)
             
         except Exception as e:
@@ -1197,7 +1196,7 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
         page = await context.new_page()
         
         # Start Listening for WebSockets BEFORE navigation
-        page.on("websocket", lambda ws: asyncio.create_task(_augestel_ws_listener(ws)))
+        page.on("websocket", lambda ws: asyncio.create_task(_augestel_ws_listener(ws, str(panel_id))))
         
         await page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(4000)
