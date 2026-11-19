@@ -711,20 +711,42 @@ async def run_db(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
-def admin_only(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        query = update.callback_query
-        user = update.effective_user
-        if query:
-            try:
-                await query.answer()
-            except Exception:
-                pass
-        if not user or not (await run_db(is_admin_sync, user.id)):
-            return ConversationHandler.END
-        return await func(update, context, *args, **kwargs)
-    return wrapper
+def admin_only(func=None, *, perm: Optional[str] = None):
+    def decorator(fn):
+        @wraps(fn)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+            query = update.callback_query
+            user = update.effective_user
+            if not user or not (await run_db(is_admin_sync, user.id)):
+                if query:
+                    try:
+                        await query.answer("⛔ Unauthorized!", show_alert=True)
+                    except Exception:
+                        pass
+                return ConversationHandler.END
+            if perm and not (await run_db(has_admin_perm_sync, user.id, perm)):
+                if query:
+                    try:
+                        await query.answer("⛔ Unauthorized! Permission denied.", show_alert=True)
+                    except Exception:
+                        pass
+                elif update.message:
+                    try:
+                        await update.message.reply_text("⛔ Unauthorized! You do not have permission for this action.")
+                    except Exception:
+                        pass
+                return ConversationHandler.END
+            if query:
+                try:
+                    await query.answer()
+                except Exception:
+                    pass
+            return await fn(update, context, *args, **kwargs)
+        return wrapper
+
+    if func is not None and callable(func):
+        return decorator(func)
+    return decorator
 
 
 # ============================================================
@@ -782,8 +804,8 @@ def set_user_banned_sync(user_id: int, banned: bool, reason: str = "") -> bool:
         _NOT_BANNED_CACHE[user_id] = time.time()
 
     update_data = {"is_banned": banned, "dirty": True}
-    if reason:
-        update_data["ban_reason"] = reason
+    if reason or not banned:
+        update_data["ban_reason"] = reason if banned else ""
     try:
         supabase.table("users").update(update_data).eq("user_id", user_id).execute()
         return True
@@ -801,6 +823,46 @@ def set_user_banned_sync(user_id: int, banned: bool, reason: str = "") -> bool:
             return True
 
 
+def is_abuse_autoban_enabled() -> bool:
+    return get_setting("autoban_abuse_enabled", "true") == "true"
+
+
+def get_abuse_ban_threshold() -> int:
+    try:
+        val = int(float(get_setting("autoban_abuse_threshold", str(NUMBER_CHANGE_BAN_THRESHOLD)) or NUMBER_CHANGE_BAN_THRESHOLD))
+        return max(1, val)
+    except Exception:
+        return NUMBER_CHANGE_BAN_THRESHOLD
+
+
+def get_abuse_ban_window() -> int:
+    try:
+        val = int(float(get_setting("autoban_abuse_window", str(int(NUMBER_CHANGE_WINDOW))) or NUMBER_CHANGE_WINDOW))
+        return max(1, val)
+    except Exception:
+        return int(NUMBER_CHANGE_WINDOW)
+
+
+def is_inactive_autoban_enabled() -> bool:
+    return get_setting("autoban_inactive_enabled", "false") == "true"
+
+
+def get_inactive_autoban_days() -> int:
+    try:
+        val = int(float(get_setting("autoban_inactive_days", "7") or 7))
+        return max(1, val)
+    except Exception:
+        return 7
+
+
+def get_inactive_autoban_min_otps() -> int:
+    try:
+        val = int(float(get_setting("autoban_inactive_min_otps", "10") or 10))
+        return max(1, val)
+    except Exception:
+        return 10
+
+
 def _check_number_cooldown(user_id: int) -> Tuple[bool, int]:
     if len(_LAST_NUMBER_CLAIM) > 50000:
         _LAST_NUMBER_CLAIM.clear()
@@ -814,14 +876,18 @@ def _check_number_cooldown(user_id: int) -> Tuple[bool, int]:
 
 
 def _record_change_and_check_ban(user_id: int) -> Tuple[bool, int]:
+    if not is_abuse_autoban_enabled():
+        return False, 0
     if len(_RECENT_NUMBER_CHANGES) > 50000:
         _RECENT_NUMBER_CHANGES.clear()
+    window_s = float(get_abuse_ban_window())
+    thresh = get_abuse_ban_threshold()
     now = time.monotonic()
-    cutoff = now - NUMBER_CHANGE_WINDOW
+    cutoff = now - window_s
     lst = [t for t in _RECENT_NUMBER_CHANGES.get(user_id, []) if t >= cutoff]
     lst.append(now)
     _RECENT_NUMBER_CHANGES[user_id] = lst
-    return len(lst) >= NUMBER_CHANGE_BAN_THRESHOLD, len(lst)
+    return len(lst) >= thresh, len(lst)
 
 
 async def _notify_admins_ban(context: ContextTypes.DEFAULT_TYPE,
@@ -831,12 +897,14 @@ async def _notify_admins_ban(context: ContextTypes.DEFAULT_TYPE,
         f"👤 User: <a href=\"tg://user?id={user_id}\">{html.escape(name)}</a>\n"
         f"🆔 ID: <code>{user_id}</code>\n"
         f"📝 Reason: {html.escape(reason)}\n\n"
-        f"To unban: <b>User Manager → Search User</b>"
+        f"To unban: <b>User Manager → User Control</b>"
     )
     targets = set()
     if ADMIN_ID:
         targets.add(ADMIN_ID)
-    targets.update(ADMINS_CACHE)
+    for aid in ADMINS_CACHE:
+        if has_admin_perm_sync(aid, "users"):
+            targets.add(aid)
     for admin_id in targets:
         try:
             await context.bot.send_message(chat_id=admin_id, text=msg, parse_mode="HTML")
@@ -2040,10 +2108,132 @@ def get_usernames_batch(user_ids: list) -> dict:
     return result
 
 
+ADMIN_PERMISSIONS = [
+    ("services", "🏷️ Services Control"),
+    ("broadcast", "📢 Broadcast Control"),
+    ("users", "👥 Users Control"),
+    ("admins", "🛡️ Admin Control"),
+    ("payouts", "💰 Manage Payouts"),
+    ("live_receivers", "📡 Live Receivers"),
+    ("links", "🔗 Links Control"),
+    ("api", "🔌 API Control"),
+    ("number_qty", "🔢 Number Quality"),
+    ("extra", "⚙️ Extra Control"),
+    ("withdraw_settings", "💳 Withdraw Settings"),
+]
+
+ADMIN_ROLE_PRESETS = {
+    "support": {
+        "label": "Support",
+        "perms": ["services", "broadcast", "live_receivers"],
+    },
+    "payout_manager": {
+        "label": "Payout Manager",
+        "perms": ["payouts", "withdraw_settings"],
+    },
+    "super_admin": {
+        "label": "Super Admin",
+        "perms": [k for k, _ in ADMIN_PERMISSIONS],
+    },
+    "custom": {
+        "label": "Custom",
+        "perms": [],
+    },
+}
+
+
 def is_admin_sync(user_id: int) -> bool:
     if user_id == ADMIN_ID:
         return True
     return user_id in ADMINS_CACHE
+
+
+def get_admin_perms_record_sync(user_id: int) -> dict:
+    if user_id == ADMIN_ID:
+        return {
+            "role": "owner",
+            "perms": {k: True for k, _ in ADMIN_PERMISSIONS},
+        }
+    raw = get_setting(f"admin_perms:{user_id}", "")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                raw_perms = parsed.get("perms", {})
+                perms = {k: bool(raw_perms.get(k, False)) for k, _ in ADMIN_PERMISSIONS}
+                role = str(parsed.get("role") or "custom")
+                return {"role": role, "perms": perms}
+        except Exception:
+            pass
+    # Legacy admins without stored permission JSON default to super_admin until edited
+    return {
+        "role": "super_admin",
+        "perms": {k: True for k, _ in ADMIN_PERMISSIONS},
+    }
+
+
+def set_admin_perms_sync(user_id: int, role: str, perms: dict):
+    if user_id == ADMIN_ID:
+        return
+    clean_perms = {k: bool(perms.get(k, False)) for k, _ in ADMIN_PERMISSIONS}
+    set_setting(
+        f"admin_perms:{user_id}",
+        json.dumps({"role": role, "perms": clean_perms}),
+    )
+
+
+def apply_admin_role_preset_sync(user_id: int, role_key: str):
+    if user_id == ADMIN_ID or role_key not in ADMIN_ROLE_PRESETS:
+        return
+    if role_key == "custom":
+        rec = get_admin_perms_record_sync(user_id)
+        set_admin_perms_sync(user_id, "custom", rec["perms"])
+        return
+    preset_perms = set(ADMIN_ROLE_PRESETS[role_key]["perms"])
+    perms = {k: (k in preset_perms) for k, _ in ADMIN_PERMISSIONS}
+    set_admin_perms_sync(user_id, role_key, perms)
+
+
+def toggle_admin_perm_sync(user_id: int, perm_key: str) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+    rec = get_admin_perms_record_sync(user_id)
+    perms = dict(rec["perms"])
+    new_val = not bool(perms.get(perm_key, False))
+    perms[perm_key] = new_val
+    set_admin_perms_sync(user_id, "custom", perms)
+    return new_val
+
+
+def has_admin_perm_sync(user_id: int, perm: str) -> bool:
+    if not user_id:
+        return False
+    if user_id == ADMIN_ID:
+        return True
+    if not is_admin_sync(user_id):
+        return False
+    rec = get_admin_perms_record_sync(user_id)
+    perms = rec.get("perms", {})
+    if perm == "withdraw_settings":
+        return bool(perms.get("withdraw_settings") or perms.get("extra"))
+    return bool(perms.get(perm, False))
+
+
+def has_any_global_settings_perm(user_id: int) -> bool:
+    return any(
+        has_admin_perm_sync(user_id, p)
+        for p in ("links", "api", "number_qty", "extra", "withdraw_settings")
+    )
+
+
+def get_admin_role_label(user_id: int) -> str:
+    if user_id == ADMIN_ID:
+        return "Owner"
+    rec = get_admin_perms_record_sync(user_id)
+    role_key = rec.get("role", "custom")
+    if role_key in ADMIN_ROLE_PRESETS:
+        return ADMIN_ROLE_PRESETS[role_key]["label"]
+    return "Custom"
 
 
 def get_all_admins_sync() -> list:
@@ -2081,6 +2271,8 @@ def delete_admin_sync(user_id: int) -> bool:
         ADMINS_CACHE.remove(user_id)
     try:
         supabase.table("admins").delete().eq("user_id", user_id).execute()
+        supabase.table("settings").delete().eq("key", f"admin_perms:{user_id}").execute()
+        SETTINGS_CACHE.pop(f"admin_perms:{user_id}", None)
         if firebase_db_ref:
             firebase_db_ref.reference(f"admins/{user_id}").delete()
         return True
@@ -2578,6 +2770,105 @@ def search_user_sync(query: str):
     except Exception as e:
         logger.error(f"search_user_sync error: {e}")
     return None
+
+
+def get_user_refer_count_sync(user_id: int) -> int:
+    try:
+        res = supabase.table("users").select("user_id", count="exact").eq("referred_by", user_id).execute()
+        return int(res.count or 0)
+    except Exception as e:
+        logger.debug(f"get_user_refer_count_sync error: {e}")
+    return 0
+
+
+def _compute_inactive_days(user_row: dict, today_bd: Optional[datetime.date] = None) -> int:
+    if today_bd is None:
+        today_bd = datetime.datetime.now(_BD_TZ).date()
+    raw = str(user_row.get("last_earn_date") or "").strip()
+    if raw and raw != "N/A":
+        try:
+            d = datetime.date.fromisoformat(raw[:10])
+            return max(0, (today_bd - d).days)
+        except Exception:
+            pass
+    return 9999
+
+
+def get_users_ordered_sync(sort_mode: str = "recent") -> list:
+    rows = get_all_users_data_sync()
+    if not rows:
+        return []
+    has_ts = any(r.get("created_at") for r in rows)
+    has_id = any(r.get("id") is not None for r in rows)
+    reverse = (sort_mode != "old")
+    if has_ts or has_id:
+        return sorted(
+            rows,
+            key=lambda r: (str(r.get("created_at") or ""), int(r.get("id") or 0), int(r.get("user_id") or 0)),
+            reverse=reverse,
+        )
+    return list(reversed(rows)) if reverse else list(rows)
+
+
+def get_banned_users_list_sync() -> list:
+    rows = get_users_ordered_sync("recent")
+    result = []
+    for r in rows:
+        uid = int(r.get("user_id") or 0)
+        if not uid:
+            continue
+        if bool(r.get("is_banned")) or (uid in _IN_MEMORY_BANNED):
+            result.append(r)
+    return result
+
+
+def get_inactive_users_list_sync(window: str = "7d") -> list:
+    win_days = {"24h": 1, "3d": 3, "7d": 7, "15d": 15, "30d": 30}.get(window, 7)
+    rows = get_all_users_data_sync()
+    today_bd = datetime.datetime.now(_BD_TZ).date()
+    result = []
+    for r in rows:
+        uid = int(r.get("user_id") or 0)
+        if not uid or is_admin_sync(uid):
+            continue
+        days = _compute_inactive_days(r, today_bd)
+        weekly = int(r.get("weekly_otps") or 0)
+        total_o = int(r.get("total_otps") or 0)
+        if days >= win_days or total_o == 0 or weekly < 10:
+            item = dict(r)
+            item["_inactive_days"] = days
+            result.append(item)
+    result.sort(key=lambda r: (-r["_inactive_days"], int(r.get("weekly_otps") or 0), int(r.get("total_otps") or 0)))
+    return result
+
+
+def run_inactive_autoban_sweep_sync() -> list:
+    if not is_inactive_autoban_enabled():
+        return []
+    min_days = get_inactive_autoban_days()
+    min_otps = get_inactive_autoban_min_otps()
+    rows = get_all_users_data_sync()
+    today_bd = datetime.datetime.now(_BD_TZ).date()
+    banned_list = []
+    for r in rows:
+        uid = int(r.get("user_id") or 0)
+        if not uid or is_admin_sync(uid):
+            continue
+        if bool(r.get("is_banned")) or (uid in _IN_MEMORY_BANNED):
+            continue
+        days = _compute_inactive_days(r, today_bd)
+        weekly = int(r.get("weekly_otps") or 0)
+        if days >= min_days and weekly < min_otps:
+            reason = f"Auto-ban: Inactive {days}d & {weekly} weekly OTPs"
+            set_user_banned_sync(uid, True, reason)
+            banned_list.append({
+                "uid": uid,
+                "name": str(r.get("first_name") or r.get("username") or f"User {uid}"),
+                "days": days,
+                "weekly": weekly,
+                "reason": reason,
+            })
+    return banned_list
 
 
 def get_global_stats_sync():
@@ -3318,21 +3609,33 @@ def cleanup_old_otp_ids_sync():
 
 def build_admin_control_view(use_premium: Optional[bool] = None):
     admins = get_all_admins_sync()
-    text = "🛠 **ADMIN CONTROL MANAGEMENT**\n\nList of System Admins:\n"
+    text = (
+        "🛠 **ADMIN CONTROL MANAGEMENT**\n\n"
+        f"Total Admins: `{len(admins)}`\n"
+        "Select an admin below to view/manage permissions or add a new admin."
+    )
     buttons = []
 
     for adm in admins:
         uid = adm["user_id"]
         name = adm["name"]
         is_owner = adm.get("is_owner", False) or (uid == ADMIN_ID)
-        role_label = "👑 Main Owner" if is_owner else "🛡️ Admin"
-        text += f"\n• **{escape_md(name)}** (`{uid}`) - {role_label}"
-        if not is_owner:
-            buttons.append([_admin_inline_btn(
-                f"Remove {name}", callback_data=f"adm:delconf:{uid}",
-                style="danger", emoji_id="5422557736330106570",
-                fallback_emoji="🗑️", use_premium=use_premium,
-            )])
+        if is_owner:
+            label = f"👑 {name} [Owner]"
+            style = "primary"
+            emoji_id = "5258508428212445001"
+            fallback_e = "👑"
+        else:
+            role_lbl = get_admin_role_label(uid)
+            label = f"{name} [{role_lbl}]"
+            style = "primary"
+            emoji_id = "5258508428212445001"
+            fallback_e = "🛡️"
+        buttons.append([_admin_inline_btn(
+            label, callback_data=f"adm:ctrl:view:{uid}",
+            style=style, emoji_id=emoji_id,
+            fallback_emoji=fallback_e, use_premium=use_premium,
+        )])
 
     buttons.append([_admin_inline_btn(
         "Add New Admin", callback_data="adm:add:start",
@@ -3346,6 +3649,121 @@ def build_admin_control_view(use_premium: Optional[bool] = None):
             fallback_emoji="◀️", use_premium=use_premium,
         ),
     ])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_admin_detail_view(target_uid: int, use_premium: Optional[bool] = None):
+    admins = get_all_admins_sync()
+    target_adm = next((a for a in admins if a["user_id"] == target_uid), None)
+    name = target_adm["name"] if target_adm else f"Admin {target_uid}"
+    is_owner = (target_uid == ADMIN_ID) or (target_adm and target_adm.get("is_owner", False))
+
+    if is_owner:
+        text = (
+            "👑 **MAIN OWNER PROFILE**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 **Name:** `{escape_md(name)}`\n"
+            f"🆔 **User ID:** `{target_uid}`\n"
+            f"🛡️ **Role:** `Main Owner (All Permissions)`\n\n"
+            "🔒 _Main Owner permissions cannot be restricted and the Owner cannot be removed._"
+        )
+        buttons = [[
+            _admin_inline_btn(
+                "Back", callback_data="adm:ctrl:list",
+                style="danger", emoji_id="5456187398977247949",
+                fallback_emoji="◀️", use_premium=use_premium,
+            )
+        ]]
+        return text, InlineKeyboardMarkup(buttons)
+
+    rec = get_admin_perms_record_sync(target_uid)
+    role_key = rec.get("role", "custom")
+    role_label = ADMIN_ROLE_PRESETS.get(role_key, {}).get("label", "Custom")
+    perms = rec.get("perms", {})
+    enabled_cnt = sum(1 for k, _ in ADMIN_PERMISSIONS if perms.get(k, False))
+
+    text = (
+        "🛡️ **ADMIN PERMISSIONS**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 **Name:** `{escape_md(name)}`\n"
+        f"🆔 **User ID:** `{target_uid}`\n"
+        f"🎭 **Role Preset:** `{role_label}`\n"
+        f"🔑 **Enabled Rights:** `{enabled_cnt}/{len(ADMIN_PERMISSIONS)}`\n\n"
+        "Select a quick preset or toggle individual permissions below:"
+    )
+
+    buttons = [
+        [
+            create_button(
+                f"{'• Support •' if role_key == 'support' else 'Support'}",
+                callback_data=f"adm:ctrl:preset:{target_uid}:support",
+                style="success" if role_key == "support" else "primary",
+            ),
+            create_button(
+                f"{'• Payout Mgr •' if role_key == 'payout_manager' else 'Payout Mgr'}",
+                callback_data=f"adm:ctrl:preset:{target_uid}:payout_manager",
+                style="success" if role_key == "payout_manager" else "primary",
+            ),
+        ],
+        [
+            create_button(
+                f"{'• Super Admin •' if role_key == 'super_admin' else 'Super Admin'}",
+                callback_data=f"adm:ctrl:preset:{target_uid}:super_admin",
+                style="success" if role_key == "super_admin" else "primary",
+            ),
+            create_button(
+                f"{'• Custom •' if role_key == 'custom' else 'Custom'}",
+                callback_data=f"adm:ctrl:preset:{target_uid}:custom",
+                style="success" if role_key == "custom" else "primary",
+            ),
+        ],
+    ]
+
+    for i in range(0, len(ADMIN_PERMISSIONS), 2):
+        row = []
+        for p_key, p_label in ADMIN_PERMISSIONS[i:i + 2]:
+            on = bool(perms.get(p_key, False))
+            short_lbl = strip_all_emojis(p_label) or p_label
+            btn_lbl = f"{'✅' if on else '❌'} {short_lbl}"
+            row.append(create_button(
+                btn_lbl,
+                callback_data=f"adm:ctrl:perm:{target_uid}:{p_key}",
+                style="success" if on else "danger",
+            ))
+        buttons.append(row)
+
+    buttons.append([_admin_inline_btn(
+        "Remove Admin", callback_data=f"adm:delconf:{target_uid}",
+        style="danger", emoji_id="5422557736330106570",
+        fallback_emoji="🗑️", use_premium=use_premium,
+    )])
+    buttons.append([_admin_inline_btn(
+        "Back", callback_data="adm:ctrl:list",
+        style="primary", emoji_id="5456187398977247949",
+        fallback_emoji="◀️", use_premium=use_premium,
+    )])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_admin_role_picker_view(target_uid: int, admin_name: str):
+    text = (
+        f"✅ Admin **{escape_md(admin_name)}** (`{target_uid}`) added!\n\n"
+        "🎭 **SELECT ROLE / PERMISSION PRESET:**\n"
+        "• **Support:** Services, Broadcast, Live Receivers\n"
+        "• **Payout Manager:** Manage Payouts, Withdraw Settings\n"
+        "• **Super Admin:** All Permissions\n"
+        "• **Custom:** Choose permissions manually"
+    )
+    buttons = [
+        [
+            create_button("🎧 Support", callback_data=f"adm:add:role:{target_uid}:support", style="primary"),
+            create_button("💰 Payout Manager", callback_data=f"adm:add:role:{target_uid}:payout_manager", style="primary"),
+        ],
+        [
+            create_button("🛡️ Super Admin", callback_data=f"adm:add:role:{target_uid}:super_admin", style="success"),
+            create_button("⚙️ Custom", callback_data=f"adm:add:role:{target_uid}:custom", style="danger"),
+        ],
+    ]
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -3697,14 +4115,277 @@ def build_live_receivers_summary_view(
     return text, InlineKeyboardMarkup(buttons)
 
 
-def build_user_manager_view(use_premium: Optional[bool] = None):
-    text = "👥 **USER MANAGER**\n\nManage users, control admins, search for specific user details, view global statistics, or export the database."
+def build_user_manager_view(use_premium: Optional[bool] = None, user_id: int = 0):
+    text = "👥 **USER MANAGER**\n\nManage users, control admins, view global statistics, or export the database."
+    buttons = []
+    can_users = (user_id == 0) or has_admin_perm_sync(user_id, "users")
+    can_admins = (user_id == 0) or has_admin_perm_sync(user_id, "admins")
+    if can_users:
+        buttons.append([_admin_inline_btn("User Control", callback_data="adm:usr:control", style="primary", emoji_id="6307589808424228455", fallback_emoji="👥", use_premium=use_premium)])
+    if can_admins:
+        buttons.append([_admin_inline_btn("Admin Control", callback_data="adm:ctrl:list", style="primary", emoji_id="5258508428212445001", fallback_emoji="🛡️", use_premium=use_premium)])
+    if can_users:
+        buttons.append([_admin_inline_btn("Statistics", callback_data="adm:usr:stats", style="primary", emoji_id="5352877703043258544", fallback_emoji="📊", use_premium=use_premium)])
+        buttons.append([_admin_inline_btn("Export Users (JSON)", callback_data="adm:usr:export", style="success", emoji_id="6039573425268201570", fallback_emoji="📤", use_premium=use_premium)])
+    buttons.append([_admin_inline_btn("Back to Panel", callback_data="adm:panel_back", style="danger", emoji_id="5456187398977247949", fallback_emoji="◀️", use_premium=use_premium)])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_user_control_view(use_premium: Optional[bool] = None):
+    text = "👥 **USER CONTROL**\n\nSearch specific users, browse all/banned/inactive users, or configure Auto Ban rules."
     buttons = [
-        [_admin_inline_btn("Search User", callback_data="adm:usr:search", style="primary", emoji_id="6307589808424228455", fallback_emoji="🔍", use_premium=use_premium)],
-        [_admin_inline_btn("Admin Control", callback_data="adm:ctrl:list", style="primary", emoji_id="5258508428212445001", fallback_emoji="🛡️", use_premium=use_premium)],
-        [_admin_inline_btn("Statistics", callback_data="adm:usr:stats", style="primary", emoji_id="5352877703043258544", fallback_emoji="📊", use_premium=use_premium)],
-        [_admin_inline_btn("Export Users (JSON)", callback_data="adm:usr:export", style="success", emoji_id="6039573425268201570", fallback_emoji="📤", use_premium=use_premium)],
-        [_admin_inline_btn("Back to Panel", callback_data="adm:panel_back", style="danger", emoji_id="5456187398977247949", fallback_emoji="◀️", use_premium=use_premium)]
+        [_admin_inline_btn("Search User", callback_data="adm:usr:search", style="primary", emoji_id="5352922460897452503", fallback_emoji="🔍", use_premium=use_premium)],
+        [
+            _admin_inline_btn("All Users", callback_data="adm:usr:all:recent:1", style="primary", emoji_id="6307589808424228455", fallback_emoji="👥", use_premium=use_premium),
+            _admin_inline_btn("Banned Users", callback_data="adm:usr:banned:1", style="danger", emoji_id="5422557736330106570", fallback_emoji="🚫", use_premium=use_premium),
+        ],
+        [
+            _admin_inline_btn("Inactive Users", callback_data="adm:usr:inactive:7d:1", style="primary", emoji_id="5472239203590888751", fallback_emoji="⏳", use_premium=use_premium),
+            _admin_inline_btn("Auto Ban System", callback_data="adm:usr:autoban", style="danger", emoji_id="5258096772776991776", fallback_emoji="🛡️", use_premium=use_premium),
+        ],
+        [_admin_inline_btn("Back", callback_data="adm:usr:manager", style="danger", emoji_id="5456187398977247949", fallback_emoji="◀️", use_premium=use_premium)],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def _encode_usr_back(back_cb: str) -> str:
+    if back_cb.startswith("adm:usr:all:"):
+        parts = back_cb.split(":")
+        sort_short = "o" if (len(parts) > 3 and parts[3] == "old") else "r"
+        page = parts[4] if len(parts) > 4 else "1"
+        return f"a:{sort_short}:{page}"
+    if back_cb.startswith("adm:usr:banned:"):
+        page = back_cb.split(":")[-1] or "1"
+        return f"b:{page}"
+    if back_cb.startswith("adm:usr:inactive:"):
+        parts = back_cb.split(":")
+        win = parts[3] if len(parts) > 3 else "7d"
+        page = parts[4] if len(parts) > 4 else "1"
+        return f"i:{win}:{page}"
+    return "c"
+
+
+def _decode_usr_back(tok: str) -> str:
+    if not tok or tok == "c":
+        return "adm:usr:control"
+    parts = tok.split(":")
+    if parts[0] == "a":
+        sort_mode = "old" if (len(parts) > 1 and parts[1] == "o") else "recent"
+        page = parts[2] if len(parts) > 2 else "1"
+        return f"adm:usr:all:{sort_mode}:{page}"
+    if parts[0] == "b":
+        page = parts[1] if len(parts) > 1 else "1"
+        return f"adm:usr:banned:{page}"
+    if parts[0] == "i":
+        win = parts[1] if len(parts) > 1 else "7d"
+        page = parts[2] if len(parts) > 2 else "1"
+        return f"adm:usr:inactive:{win}:{page}"
+    return "adm:usr:control"
+
+
+def build_all_users_view(sort_mode: str = "recent", page: int = 1, use_premium: Optional[bool] = None):
+    if sort_mode not in ("recent", "old"):
+        sort_mode = "recent"
+    users = get_users_ordered_sync(sort_mode)
+    total = len(users)
+    per_page = 25
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start_idx = (page - 1) * per_page
+    page_items = users[start_idx:start_idx + per_page]
+
+    sort_lbl = "Recent Joined" if sort_mode == "recent" else "Old Users"
+    text = (
+        "👥 **ALL USERS**\n"
+        f"Total: `{total}` • Sort: `{sort_lbl}` • Page `{page}/{total_pages}`\n\n"
+        "Tap a user below to view summary & Ban/Unban:"
+    )
+
+    back_tok = f"a:{'o' if sort_mode == 'old' else 'r'}:{page}"
+    buttons = []
+    for u in page_items:
+        uid = int(u.get("user_id") or 0)
+        if not uid:
+            continue
+        fname = _truncate_text(str(u.get("first_name") or u.get("username") or f"User {uid}"), 22)
+        bal = fmt_num(u.get("balance", 0))
+        is_ban = bool(u.get("is_banned")) or (uid in _IN_MEMORY_BANNED)
+        prefix = "🚫 " if is_ban else ""
+        buttons.append([create_button(
+            f"{prefix}{fname} ({bal}৳)",
+            callback_data=f"adm:usr:view:{uid}:{back_tok}",
+            style="danger" if is_ban else "primary",
+        )])
+
+    buttons.append([
+        create_button(
+            f"{'• Recent Joined •' if sort_mode == 'recent' else 'Recent Joined'}",
+            callback_data="adm:usr:all:recent:1",
+            style="success" if sort_mode == "recent" else "primary",
+        ),
+        create_button(
+            f"{'• Old Users •' if sort_mode == 'old' else 'Old Users'}",
+            callback_data="adm:usr:all:old:1",
+            style="success" if sort_mode == "old" else "primary",
+        ),
+    ])
+
+    if total_pages > 1:
+        nav = []
+        if page > 1:
+            nav.append(_admin_inline_btn("Prev", callback_data=f"adm:usr:all:{sort_mode}:{page - 1}", style="primary", emoji_id="5456187398977247949", fallback_emoji="◀️", use_premium=use_premium))
+        nav.append(create_button(f"{page}/{total_pages}", callback_data="noop", style="primary"))
+        if page < total_pages:
+            nav.append(_admin_inline_btn("Next", callback_data=f"adm:usr:all:{sort_mode}:{page + 1}", style="primary", emoji_id="5370604433233177619", fallback_emoji="▶️", use_premium=use_premium, emoji_after=True))
+        buttons.append(nav)
+
+    buttons.append([_admin_inline_btn("Back", callback_data="adm:usr:control", style="danger", emoji_id="5456187398977247949", fallback_emoji="◀️", use_premium=use_premium)])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_banned_users_view(page: int = 1, use_premium: Optional[bool] = None):
+    users = get_banned_users_list_sync()
+    total = len(users)
+    per_page = 25
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start_idx = (page - 1) * per_page
+    page_items = users[start_idx:start_idx + per_page]
+
+    text = (
+        "🚫 **BANNED USERS**\n"
+        f"Total Banned: `{total}` • Page `{page}/{total_pages}`\n\n"
+        + ("Tap a user below to inspect or Unban:" if page_items else "_No banned users found._")
+    )
+
+    back_tok = f"b:{page}"
+    buttons = []
+    for u in page_items:
+        uid = int(u.get("user_id") or 0)
+        if not uid:
+            continue
+        fname = _truncate_text(str(u.get("first_name") or u.get("username") or f"User {uid}"), 22)
+        bal = fmt_num(u.get("balance", 0))
+        buttons.append([create_button(
+            f"🚫 {fname} ({bal}৳)",
+            callback_data=f"adm:usr:view:{uid}:{back_tok}",
+            style="danger",
+        )])
+
+    if total_pages > 1:
+        nav = []
+        if page > 1:
+            nav.append(_admin_inline_btn("Prev", callback_data=f"adm:usr:banned:{page - 1}", style="primary", emoji_id="5456187398977247949", fallback_emoji="◀️", use_premium=use_premium))
+        nav.append(create_button(f"{page}/{total_pages}", callback_data="noop", style="primary"))
+        if page < total_pages:
+            nav.append(_admin_inline_btn("Next", callback_data=f"adm:usr:banned:{page + 1}", style="primary", emoji_id="5370604433233177619", fallback_emoji="▶️", use_premium=use_premium, emoji_after=True))
+        buttons.append(nav)
+
+    buttons.append([_admin_inline_btn("Back", callback_data="adm:usr:control", style="danger", emoji_id="5456187398977247949", fallback_emoji="◀️", use_premium=use_premium)])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_inactive_users_view(window: str = "7d", page: int = 1, use_premium: Optional[bool] = None):
+    if window not in ("24h", "3d", "7d", "15d", "30d"):
+        window = "7d"
+    users = get_inactive_users_list_sync(window)
+    total = len(users)
+    per_page = 25
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, total_pages))
+    start_idx = (page - 1) * per_page
+    page_items = users[start_idx:start_idx + per_page]
+
+    text = (
+        "⏳ **INACTIVE USERS**\n"
+        f"Filter: `No OTP in {window}` or `< 10 weekly OTPs`\n"
+        f"Matched: `{total}` • Page `{page}/{total_pages}`\n\n"
+        + ("Tap a user below to view summary & Ban/Unban:" if page_items else "_No inactive users matched for this window._")
+    )
+
+    back_tok = f"i:{window}:{page}"
+    buttons = []
+    for u in page_items:
+        uid = int(u.get("user_id") or 0)
+        if not uid:
+            continue
+        fname = _truncate_text(str(u.get("first_name") or u.get("username") or f"User {uid}"), 20)
+        days = int(u.get("_inactive_days", 0))
+        days_lbl = "Never" if days >= 9999 else f"{days}d inactive"
+        is_ban = bool(u.get("is_banned")) or (uid in _IN_MEMORY_BANNED)
+        prefix = "🚫 " if is_ban else ""
+        buttons.append([create_button(
+            f"{prefix}{fname} ({days_lbl})",
+            callback_data=f"adm:usr:view:{uid}:{back_tok}",
+            style="danger" if is_ban else "primary",
+        )])
+
+    def _wbtn(w: str, lbl: str):
+        active = (window == w)
+        return create_button(
+            f"• {lbl} •" if active else lbl,
+            callback_data=f"adm:usr:inactive:{w}:1",
+            style="success" if active else "primary",
+        )
+
+    buttons.append([_wbtn("24h", "24h"), _wbtn("3d", "3d"), _wbtn("7d", "7d")])
+    buttons.append([
+        _wbtn("15d", "15d"),
+        _wbtn("30d", "30d"),
+        _admin_inline_btn("Refresh", callback_data=f"adm:usr:inactive:{window}:{page}", style="success", emoji_id="5244758760429213978", fallback_emoji="🔄", use_premium=use_premium),
+    ])
+
+    if total_pages > 1:
+        nav = []
+        if page > 1:
+            nav.append(_admin_inline_btn("Prev", callback_data=f"adm:usr:inactive:{window}:{page - 1}", style="primary", emoji_id="5456187398977247949", fallback_emoji="◀️", use_premium=use_premium))
+        nav.append(create_button(f"{page}/{total_pages}", callback_data="noop", style="primary"))
+        if page < total_pages:
+            nav.append(_admin_inline_btn("Next", callback_data=f"adm:usr:inactive:{window}:{page + 1}", style="primary", emoji_id="5370604433233177619", fallback_emoji="▶️", use_premium=use_premium, emoji_after=True))
+        buttons.append(nav)
+
+    buttons.append([_admin_inline_btn("Back", callback_data="adm:usr:control", style="danger", emoji_id="5456187398977247949", fallback_emoji="◀️", use_premium=use_premium)])
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_autoban_settings_view(use_premium: Optional[bool] = None):
+    abuse_on = is_abuse_autoban_enabled()
+    thresh = get_abuse_ban_threshold()
+    window_s = get_abuse_ban_window()
+
+    inact_on = is_inactive_autoban_enabled()
+    inact_days = get_inactive_autoban_days()
+    inact_otps = get_inactive_autoban_min_otps()
+
+    text = (
+        "🛡️ **AUTO BAN SYSTEM**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔁 **Number-Change Abuse Ban:** `{'ENABLED 🟢' if abuse_on else 'DISABLED 🔴'}`\n"
+        f"   • Limit: `{thresh}` changes in `{window_s}s`\n\n"
+        f"⏳ **Inactive User Auto-Ban:** `{'ENABLED 🟢' if inact_on else 'DISABLED 🔴'}`\n"
+        f"   • Rule: Inactive `>= {inact_days}d` & Weekly OTPs `< {inact_otps}`"
+    )
+    buttons = [
+        [create_button(
+            f"Abuse Auto-Ban: {'ENABLED 🟢' if abuse_on else 'DISABLED 🔴'}",
+            callback_data="adm:usr:ab:tog_abuse",
+            style="success" if abuse_on else "danger",
+        )],
+        [
+            create_button(f"Max Changes ({thresh})", callback_data="adm:usr:ab:set_thresh", style="primary"),
+            create_button(f"Window ({window_s}s)", callback_data="adm:usr:ab:set_win", style="primary"),
+        ],
+        [create_button(
+            f"Inactive Auto-Ban: {'ENABLED 🟢' if inact_on else 'DISABLED 🔴'}",
+            callback_data="adm:usr:ab:tog_inact",
+            style="success" if inact_on else "danger",
+        )],
+        [
+            create_button(f"Inactive Days ({inact_days}d)", callback_data="adm:usr:ab:set_days", style="primary"),
+            create_button(f"Min Weekly OTPs ({inact_otps})", callback_data="adm:usr:ab:set_otps", style="primary"),
+        ],
+        [create_button("⚡ Run Inactive Ban Sweep Now", callback_data="adm:usr:ab:run_now", style="danger")],
+        [_admin_inline_btn("Back", callback_data="adm:usr:control", style="primary", emoji_id="5456187398977247949", fallback_emoji="◀️", use_premium=use_premium)],
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -4099,7 +4780,21 @@ def build_force_join_view():
     return text, InlineKeyboardMarkup(buttons)
 
 
-def build_extra_settings_view():
+def build_extra_settings_view(user_id: int = 0):
+    has_full_extra = (user_id == 0) or has_admin_perm_sync(user_id, "extra")
+    has_withdraw = (user_id == 0) or has_admin_perm_sync(user_id, "withdraw_settings")
+
+    text = (
+        "⚙️ **EXTRA SETTINGS**\n\n"
+        "Select an option to toggle or configure:"
+    )
+
+    if not has_full_extra:
+        buttons = []
+        if has_withdraw:
+            buttons.append([create_button("Withdraw Settings", callback_data="adm:w_settings", style="primary", icon_custom_emoji_id="5258096772776991776")])
+        return text, InlineKeyboardMarkup(buttons)
+
     show_msg = get_setting("show_message", "true") == "true"
     show_country_count = get_setting("show_country_count", "false") == "true"
     show_dev = get_setting("show_developer", "true") == "true"
@@ -4111,10 +4806,6 @@ def build_extra_settings_view():
     dev_status = "ENABLED 🟢" if show_dev else "DISABLED 🔴"
     otp_format_label = "PREMIUM (Table) 🟢" if premium_on else "REGULAR 🔴"
 
-    text = (
-        "⚙️ **EXTRA SETTINGS**\n\n"
-        "Select an option to toggle or configure:"
-    )
     buttons = [
         [create_button(f"Show Message: {msg_status}", callback_data="adm:toggle:show_msg", style="success" if show_msg else "danger", icon_custom_emoji_id="5258096772776991776")],
         [create_button(f"Number Count: {count_status}", callback_data="adm:toggle:country_count", style="success" if show_country_count else "danger", icon_custom_emoji_id="5258096772776991776")],
@@ -4124,12 +4815,17 @@ def build_extra_settings_view():
             create_button("Refer System", callback_data="adm:refer_settings", style="primary", icon_custom_emoji_id="5258096772776991776"),
             create_button("Force Join Settings", callback_data="adm:fj_settings", style="primary", icon_custom_emoji_id="5258096772776991776"),
         ],
-        [
+    ]
+    if has_withdraw:
+        buttons.append([
             create_button("Withdraw Settings", callback_data="adm:w_settings", style="primary", icon_custom_emoji_id="5258096772776991776"),
             create_button("Ranking Bonuses", callback_data="adm:r_bonus_settings", style="primary", icon_custom_emoji_id="5258096772776991776"),
-        ],
-        [create_button("CLI Emojis", callback_data="adm:cliemoji:list", style="primary", icon_custom_emoji_id="5258096772776991776")],
-    ]
+        ])
+    else:
+        buttons.append([
+            create_button("Ranking Bonuses", callback_data="adm:r_bonus_settings", style="primary", icon_custom_emoji_id="5258096772776991776"),
+        ])
+    buttons.append([create_button("CLI Emojis", callback_data="adm:cliemoji:list", style="primary", icon_custom_emoji_id="5258096772776991776")])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -4170,7 +4866,7 @@ def build_cli_emojis_view():
     return text, InlineKeyboardMarkup(buttons)
 
 
-@admin_only
+@admin_only(perm="extra")
 async def admin_cliemoji_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text(
         "Enter the **CLI Name** (e.g., `1xbet`):",
@@ -4496,7 +5192,9 @@ def run_flask():
     WAIT_CLI_EMOJI_NAME, WAIT_CLI_EMOJI_VAL,
     WAIT_AUG_EMAIL, WAIT_AUG_PASSWORD, WAIT_AUG_API_KEY,
     WAIT_EDIT_SERVICE_NAME, WAIT_EDIT_COUNTRY_NAME, WAIT_EDIT_COUNTRY_SHORT,
-) = range(59)
+    WAIT_AUTOBAN_THRESHOLD, WAIT_AUTOBAN_WINDOW,
+    WAIT_AUTOBAN_INACTIVE_DAYS, WAIT_AUTOBAN_INACTIVE_OTPS,
+) = range(63)
 
 
 def get_main_keyboard(user_id: int):
@@ -4516,52 +5214,79 @@ def get_main_keyboard(user_id: int):
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
-def get_admin_keyboard(use_premium: Optional[bool] = None):
+def get_admin_keyboard(use_premium: Optional[bool] = None, user_id: int = 0):
     premium = _is_premium_emojis_enabled(use_premium)
-    if premium:
-        buttons = [
-            [
-                KeyboardButton("Services", icon_custom_emoji_id="5258096772776991776", style="success"),
-                KeyboardButton("Broadcast", icon_custom_emoji_id="5800920921766104807", style="success"),
-            ],
-            [
-                KeyboardButton("User Manager", icon_custom_emoji_id="6307589808424228455", style="primary"),
-                KeyboardButton("Manage Payouts", icon_custom_emoji_id="5417924076503062111", style="primary"),
-            ],
-            [
-                KeyboardButton("Live Receivers", icon_custom_emoji_id="5352877703043258544", style="primary"),
-                KeyboardButton("Global Settings", icon_custom_emoji_id="5258096772776991776", style="primary"),
-            ],
-            [
-                KeyboardButton("Back", icon_custom_emoji_id="5456187398977247949", style="danger"),
-            ],
-        ]
+    if user_id:
+        can_srv = has_admin_perm_sync(user_id, "services")
+        can_bc = has_admin_perm_sync(user_id, "broadcast")
+        can_um = has_admin_perm_sync(user_id, "users") or has_admin_perm_sync(user_id, "admins")
+        can_pay = has_admin_perm_sync(user_id, "payouts")
+        can_live = has_admin_perm_sync(user_id, "live_receivers")
+        can_gs = has_any_global_settings_perm(user_id)
     else:
-        buttons = [
-            [
-                KeyboardButton("🏷️ Services", style="success"),
-                KeyboardButton("📢 Broadcast", style="success"),
-            ],
-            [
-                KeyboardButton("👥 User Manager", style="primary"),
-                KeyboardButton("💰 Manage Payouts", style="primary"),
-            ],
-            [
-                KeyboardButton("📡 Live Receivers", style="primary"),
-                KeyboardButton("⚙️ Global Settings", style="primary"),
-            ],
-            [
-                KeyboardButton("◀️ Back", style="danger"),
-            ],
-        ]
+        can_srv = can_bc = can_um = can_pay = can_live = can_gs = True
+
+    candidates = []
+    if can_srv:
+        candidates.append(
+            KeyboardButton("Services", icon_custom_emoji_id="5258096772776991776", style="success")
+            if premium else KeyboardButton("🏷️ Services", style="success")
+        )
+    if can_bc:
+        candidates.append(
+            KeyboardButton("Broadcast", icon_custom_emoji_id="5800920921766104807", style="success")
+            if premium else KeyboardButton("📢 Broadcast", style="success")
+        )
+    if can_um:
+        candidates.append(
+            KeyboardButton("User Manager", icon_custom_emoji_id="6307589808424228455", style="primary")
+            if premium else KeyboardButton("👥 User Manager", style="primary")
+        )
+    if can_pay:
+        candidates.append(
+            KeyboardButton("Manage Payouts", icon_custom_emoji_id="5417924076503062111", style="primary")
+            if premium else KeyboardButton("💰 Manage Payouts", style="primary")
+        )
+    if can_live:
+        candidates.append(
+            KeyboardButton("Live Receivers", icon_custom_emoji_id="5352877703043258544", style="primary")
+            if premium else KeyboardButton("📡 Live Receivers", style="primary")
+        )
+    if can_gs:
+        candidates.append(
+            KeyboardButton("Global Settings", icon_custom_emoji_id="5258096772776991776", style="primary")
+            if premium else KeyboardButton("⚙️ Global Settings", style="primary")
+        )
+
+    buttons = [candidates[i:i + 2] for i in range(0, len(candidates), 2)]
+    buttons.append([
+        KeyboardButton("Back", icon_custom_emoji_id="5456187398977247949", style="danger")
+        if premium else KeyboardButton("◀️ Back", style="danger")
+    ])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-def get_global_settings_keyboard():
-    buttons = [
-        [KeyboardButton("Edit Links", icon_custom_emoji_id="5370604433233177619", style="success"), KeyboardButton("Edit API", icon_custom_emoji_id="5258096772776991776", style="success")],
-        [KeyboardButton("Number Quantity", icon_custom_emoji_id="5352877703043258544", style="primary"), KeyboardButton("Extra", icon_custom_emoji_id="5258096772776991776", style="primary")],
-        [KeyboardButton("Back", icon_custom_emoji_id="5456187398977247949", style="danger")]
-    ]
+
+def get_global_settings_keyboard(user_id: int = 0):
+    if user_id:
+        can_links = has_admin_perm_sync(user_id, "links")
+        can_api = has_admin_perm_sync(user_id, "api")
+        can_qty = has_admin_perm_sync(user_id, "number_qty")
+        can_extra = has_admin_perm_sync(user_id, "extra") or has_admin_perm_sync(user_id, "withdraw_settings")
+    else:
+        can_links = can_api = can_qty = can_extra = True
+
+    candidates = []
+    if can_links:
+        candidates.append(KeyboardButton("Edit Links", icon_custom_emoji_id="5370604433233177619", style="success"))
+    if can_api:
+        candidates.append(KeyboardButton("Edit API", icon_custom_emoji_id="5258096772776991776", style="success"))
+    if can_qty:
+        candidates.append(KeyboardButton("Number Quantity", icon_custom_emoji_id="5352877703043258544", style="primary"))
+    if can_extra:
+        candidates.append(KeyboardButton("Extra", icon_custom_emoji_id="5258096772776991776", style="primary"))
+
+    buttons = [candidates[i:i + 2] for i in range(0, len(candidates), 2)]
+    buttons.append([KeyboardButton("Back", icon_custom_emoji_id="5456187398977247949", style="danger")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
@@ -4712,36 +5437,50 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text_upper == "ADMIN PANEL" and user_is_admin:
         context.user_data['current_menu'] = 'admin'
         total_users = len(await run_db(get_all_users))
+        role_lbl = get_admin_role_label(user_id)
         panel_text = (
             f"**ADMIN PANEL**\n\n"
+            f"🎭 Role: **{role_lbl}**\n"
             f"⚙️ DB Mode: **{CURRENT_DB_MODE}**\n"
             f"👥 Total Registered Users: `{total_users}`"
         )
         await _reply_with_emoji_fallback(
             update.message,
-            lambda prem: (panel_text, get_admin_keyboard(use_premium=prem)),
+            lambda prem: (panel_text, get_admin_keyboard(use_premium=prem, user_id=user_id)),
             parse_mode="Markdown",
         )
 
     elif (text_upper == "MANAGE PAYOUTS" or text_upper == "WITHDRAW") and user_is_admin:
+        if not has_admin_perm_sync(user_id, "payouts"):
+            await update.message.reply_text("⛔ Unauthorized! You do not have permission for Manage Payouts.")
+            return
         context.user_data['current_menu'] = 'admin'
         text_msg, kbd = await run_db(build_admin_withdraw_requests_view, 1)
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "SERVICES" and user_is_admin:
+        if not has_admin_perm_sync(user_id, "services"):
+            await update.message.reply_text("⛔ Unauthorized! You do not have permission for Services Control.")
+            return
         context.user_data['current_menu'] = 'admin'
         text_msg, kbd = await run_db(build_admin_services_view)
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="HTML")
 
     elif text_upper == "USER MANAGER" and user_is_admin:
+        if not (has_admin_perm_sync(user_id, "users") or has_admin_perm_sync(user_id, "admins")):
+            await update.message.reply_text("⛔ Unauthorized! You do not have permission for User Manager.")
+            return
         context.user_data['current_menu'] = 'admin'
         await _reply_with_emoji_fallback(
             update.message,
-            lambda prem: build_user_manager_view(use_premium=prem),
+            lambda prem: build_user_manager_view(use_premium=prem, user_id=user_id),
             parse_mode="Markdown",
         )
 
     elif text_upper == "LIVE RECEIVERS" and user_is_admin:
+        if not has_admin_perm_sync(user_id, "live_receivers"):
+            await update.message.reply_text("⛔ Unauthorized! You do not have permission for Live Receivers.")
+            return
         context.user_data['current_menu'] = 'admin'
         await _reply_with_emoji_fallback(
             update.message,
@@ -4751,33 +5490,51 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif text_upper == "GLOBAL SETTINGS" and user_is_admin:
+        if not has_any_global_settings_perm(user_id):
+            await update.message.reply_text("⛔ Unauthorized! You do not have permission for Global Settings.")
+            return
         context.user_data['current_menu'] = 'global_settings'
         await update.message.reply_text(
             "⚙️ **GLOBAL SETTINGS MENU**\n\nSelect an option from below keyboard:",
-            reply_markup=get_global_settings_keyboard(), parse_mode="Markdown"
+            reply_markup=get_global_settings_keyboard(user_id=user_id), parse_mode="Markdown"
         )
 
     elif text_upper == "EDIT LINKS" and user_is_admin:
+        if not has_admin_perm_sync(user_id, "links"):
+            await update.message.reply_text("⛔ Unauthorized! You do not have permission for Links Control.")
+            return
         context.user_data['current_menu'] = 'global_settings'
         text_msg, kbd = build_edit_links_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "EDIT API" and user_is_admin:
+        if not has_admin_perm_sync(user_id, "api"):
+            await update.message.reply_text("⛔ Unauthorized! You do not have permission for API Control.")
+            return
         context.user_data['current_menu'] = 'global_settings'
         text_msg, kbd = await run_db(build_api_panels_view)
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "NUMBER QUANTITY" and user_is_admin:
+        if not has_admin_perm_sync(user_id, "number_qty"):
+            await update.message.reply_text("⛔ Unauthorized! You do not have permission for Number Quality Control.")
+            return
         context.user_data['current_menu'] = 'global_settings'
         text_msg, kbd = build_number_quantity_view()
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "EXTRA" and user_is_admin:
+        if not (has_admin_perm_sync(user_id, "extra") or has_admin_perm_sync(user_id, "withdraw_settings")):
+            await update.message.reply_text("⛔ Unauthorized! You do not have permission for Extra Settings.")
+            return
         context.user_data['current_menu'] = 'global_settings'
-        text_msg, kbd = build_extra_settings_view()
+        text_msg, kbd = build_extra_settings_view(user_id=user_id)
         await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif text_upper == "ADMIN CONTROL" and user_is_admin:
+        if not has_admin_perm_sync(user_id, "admins"):
+            await update.message.reply_text("⛔ Unauthorized! You do not have permission for Admin Control.")
+            return
         context.user_data['current_menu'] = 'admin'
         await run_db(get_all_admins_sync)
         await _reply_with_emoji_fallback(
@@ -4791,14 +5548,16 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if curr_menu == 'global_settings' and user_is_admin:
             context.user_data['current_menu'] = 'admin'
             total_users = len(await run_db(get_all_users))
+            role_lbl = get_admin_role_label(user_id)
             panel_text = (
                 f"**ADMIN PANEL**\n\n"
+                f"🎭 Role: **{role_lbl}**\n"
                 f"⚙️ DB Mode: **{CURRENT_DB_MODE}**\n"
                 f"👥 Total Registered Users: `{total_users}`"
             )
             await _reply_with_emoji_fallback(
                 update.message,
-                lambda prem: (panel_text, get_admin_keyboard(use_premium=prem)),
+                lambda prem: (panel_text, get_admin_keyboard(use_premium=prem, user_id=user_id)),
                 parse_mode="Markdown",
             )
         else:
@@ -4936,7 +5695,7 @@ async def receive_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="payouts")
 async def start_edit_payout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     parts = query.data.split(":", 4)
@@ -5025,17 +5784,24 @@ async def receive_cc_length(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ADD_NUMBERS
 
 
-def _build_user_detail_view(uid: int, user_data: dict) -> Tuple[str, InlineKeyboardMarkup]:
+def _build_user_detail_view(
+    uid: int,
+    user_data: dict,
+    back_cb: str = "adm:usr:control",
+    refer_count: Optional[int] = None,
+) -> Tuple[str, InlineKeyboardMarkup]:
     uname = user_data.get("username") or "No username"
     fname = user_data.get("first_name") or "No name"
     balance = fmt_num(user_data.get("balance", 0))
     today = fmt_num(user_data.get("today_earned", 0))
     total_e = fmt_num(user_data.get("total_earned", 0))
     ref_e = fmt_num(user_data.get("refer_earned", 0))
-    total_o = user_data.get("total_otps", 0)
-    weekly_o = user_data.get("weekly_otps", 0)
+    total_o = int(user_data.get("total_otps") or 0)
+    weekly_o = int(user_data.get("weekly_otps") or 0)
     ref_by = user_data.get("referred_by") or "None"
     last_date = user_data.get("last_earn_date") or "N/A"
+    if refer_count is None:
+        refer_count = get_user_refer_count_sync(uid)
 
     is_banned = bool(user_data.get("is_banned", False)) or (uid in _IN_MEMORY_BANNED)
     ban_reason = ""
@@ -5043,38 +5809,40 @@ def _build_user_detail_view(uid: int, user_data: dict) -> Tuple[str, InlineKeybo
         ban_reason = _IN_MEMORY_BAN_REASONS.get(uid) or user_data.get("ban_reason") or ""
 
     status_icon = "🚫 <b>BANNED</b>" if is_banned else "✅ Active"
+    back_tok = _encode_usr_back(back_cb)
 
     text = (
         f"👤 <b>USER DETAILS</b>\n\n"
+        f"👤 <b>Name:</b> {html.escape(fname)}\n"
         f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
-        f"👤 <b>First Name:</b> {html.escape(fname)}\n"
         f"🏷️ <b>Username:</b> @{html.escape(uname)}\n"
         f"📊 <b>Status:</b> {status_icon}\n"
         f"💰 <b>Balance:</b> <code>{balance} ৳</code>\n"
-        f"📈 <b>Total Earned:</b> <code>{total_e} ৳</code>\n"
+        f"📈 <b>Lifetime Earnings:</b> <code>{total_e} ৳</code> (<code>{total_o} OTPs</code>)\n"
         f"📅 <b>Today Earned:</b> <code>{today} ৳</code>\n"
-        f"🎁 <b>Refer Earned:</b> <code>{ref_e} ৳</code>\n"
-        f"📨 <b>Total OTPs:</b> <code>{total_o}</code>\n"
-        f"📊 <b>Weekly OTPs:</b> <code>{weekly_o}</code>\n"
+        f"👥 <b>Total Refers:</b> <code>{refer_count}</code>\n"
+        f"🎁 <b>Earned from Refer:</b> <code>{ref_e} ৳</code>\n"
         f"🔗 <b>Referred By:</b> <code>{ref_by}</code>\n"
-        f"📅 <b>Last Earn Date:</b> <code>{last_date}</code>"
+        f"📊 <b>Last Week OTPs:</b> <code>{weekly_o} OTPs</code>\n"
+        f"📅 <b>Last Earn Date:</b> <code>{html.escape(str(last_date))}</code>"
     )
     if is_banned and ban_reason:
         text += f"\n\n🚫 <b>Ban Reason:</b>\n<blockquote>{html.escape(ban_reason)}</blockquote>"
 
     buttons = []
     if is_banned:
-        buttons.append([create_button("🔓 Unban User", callback_data=f"adm:usr:unban:{uid}", style="success")])
+        buttons.append([create_button("🔓 Unban User", callback_data=f"adm:usr:unban:{uid}:{back_tok}", style="success")])
     else:
-        buttons.append([create_button("🚫 Ban User", callback_data=f"adm:usr:ban:{uid}", style="danger")])
-    buttons.append([create_button("🗑️ Release All Numbers", callback_data=f"adm:usr:release:{uid}", style="danger")])
-    buttons.append([create_button("🔍 Search Another", callback_data="adm:usr:search", style="primary")])
-    buttons.append([create_button("Back to User Manager", callback_data="adm:usr:manager", style="danger")])
+        buttons.append([create_button("🚫 Ban User", callback_data=f"adm:usr:ban:{uid}:{back_tok}", style="danger")])
+    buttons.append([create_button("🗑️ Release All Numbers", callback_data=f"adm:usr:release:{uid}:{back_tok}", style="danger")])
+    if back_cb == "adm:usr:control":
+        buttons.append([create_button("🔍 Search Another", callback_data="adm:usr:search", style="primary")])
+    buttons.append([create_button("Back", callback_data=back_cb, style="primary")])
 
     return text, InlineKeyboardMarkup(buttons)
 
 
-@admin_only
+@admin_only(perm="users")
 async def admin_search_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text(
         "🔍 **SEARCH USER**\n\n"
@@ -5095,13 +5863,106 @@ async def receive_user_search(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return WAIT_USER_SEARCH
 
-    uid = user_data.get("user_id")
-    text, kbd = _build_user_detail_view(uid, user_data)
+    uid = int(user_data.get("user_id"))
+    refer_count = await run_db(get_user_refer_count_sync, uid)
+    text, kbd = _build_user_detail_view(uid, user_data, back_cb="adm:usr:control", refer_count=refer_count)
     await update.message.reply_text(text, reply_markup=kbd, parse_mode="HTML")
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="users")
+async def admin_autoban_thresh_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    curr = get_abuse_ban_threshold()
+    await update.callback_query.message.reply_text(
+        f"🔁 **MAX NUMBER CHANGES LIMIT**\n\nCurrent limit: `{curr}` changes\nSend new max number changes (e.g., `3`), or /cancel:",
+        parse_mode="Markdown",
+    )
+    return WAIT_AUTOBAN_THRESHOLD
+
+
+async def receive_autoban_thresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    val_txt = update.message.text.strip()
+    if not val_txt.isdigit() or int(val_txt) < 1:
+        await update.message.reply_text("❌ Please enter a positive whole number (e.g., 3) or /cancel:")
+        return WAIT_AUTOBAN_THRESHOLD
+    val = int(val_txt)
+    await run_db(set_setting, "autoban_abuse_threshold", str(val))
+    await update.message.reply_text(f"✅ Abuse max changes updated to `{val}`!", parse_mode="Markdown")
+    text_msg, kbd = build_autoban_settings_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+@admin_only(perm="users")
+async def admin_autoban_window_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    curr = get_abuse_ban_window()
+    await update.callback_query.message.reply_text(
+        f"⏱️ **ABUSE WINDOW (SECONDS)**\n\nCurrent window: `{curr}s`\nSend new window duration in seconds (e.g., `25`), or /cancel:",
+        parse_mode="Markdown",
+    )
+    return WAIT_AUTOBAN_WINDOW
+
+
+async def receive_autoban_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    val_txt = update.message.text.strip()
+    if not val_txt.isdigit() or int(val_txt) < 1:
+        await update.message.reply_text("❌ Please enter a positive number of seconds (e.g., 25) or /cancel:")
+        return WAIT_AUTOBAN_WINDOW
+    val = int(val_txt)
+    await run_db(set_setting, "autoban_abuse_window", str(val))
+    await update.message.reply_text(f"✅ Abuse window updated to `{val}s`!", parse_mode="Markdown")
+    text_msg, kbd = build_autoban_settings_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+@admin_only(perm="users")
+async def admin_autoban_days_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    curr = get_inactive_autoban_days()
+    await update.callback_query.message.reply_text(
+        f"⏳ **INACTIVE AUTO-BAN DAYS**\n\nCurrent threshold: `{curr}` days\nSend minimum inactive days before auto-ban (e.g., `7`), or /cancel:",
+        parse_mode="Markdown",
+    )
+    return WAIT_AUTOBAN_INACTIVE_DAYS
+
+
+async def receive_autoban_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    val_txt = update.message.text.strip()
+    if not val_txt.isdigit() or int(val_txt) < 1:
+        await update.message.reply_text("❌ Please enter a positive number of days (e.g., 7) or /cancel:")
+        return WAIT_AUTOBAN_INACTIVE_DAYS
+    val = int(val_txt)
+    await run_db(set_setting, "autoban_inactive_days", str(val))
+    await update.message.reply_text(f"✅ Inactive days threshold updated to `{val}d`!", parse_mode="Markdown")
+    text_msg, kbd = build_autoban_settings_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+@admin_only(perm="users")
+async def admin_autoban_otps_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    curr = get_inactive_autoban_min_otps()
+    await update.callback_query.message.reply_text(
+        f"📨 **INACTIVE AUTO-BAN MIN WEEKLY OTPs**\n\nCurrent threshold: `{curr}` OTPs\nSend minimum weekly OTPs required to avoid ban (e.g., `10`), or /cancel:",
+        parse_mode="Markdown",
+    )
+    return WAIT_AUTOBAN_INACTIVE_OTPS
+
+
+async def receive_autoban_otps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    val_txt = update.message.text.strip()
+    if not val_txt.isdigit() or int(val_txt) < 1:
+        await update.message.reply_text("❌ Please enter a positive number (e.g., 10) or /cancel:")
+        return WAIT_AUTOBAN_INACTIVE_OTPS
+    val = int(val_txt)
+    await run_db(set_setting, "autoban_inactive_min_otps", str(val))
+    await update.message.reply_text(f"✅ Min weekly OTPs threshold updated to `{val}`!", parse_mode="Markdown")
+    text_msg, kbd = build_autoban_settings_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
+@admin_only(perm="extra")
 async def set_rank1_bonus_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text("Enter bonus amount for **Top 1** user (e.g., 50):", parse_mode="Markdown")
     return WAIT_RANK1_BONUS
@@ -5120,7 +5981,7 @@ async def receive_rank1_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="extra")
 async def set_rank2_bonus_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text("Enter bonus amount for **Top 2** user (e.g., 30):", parse_mode="Markdown")
     return WAIT_RANK2_BONUS
@@ -5139,7 +6000,7 @@ async def receive_rank2_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="extra")
 async def set_rank3_bonus_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text("Enter bonus amount for **Top 3** user (e.g., 20):", parse_mode="Markdown")
     return WAIT_RANK3_BONUS
@@ -5158,7 +6019,7 @@ async def receive_rank3_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="links")
 async def set_dev_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.message.reply_text("Enter the new Developer Name/Tag (e.g., John Doe):")
@@ -5174,7 +6035,7 @@ async def receive_dev_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="links")
 async def set_dev_link_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.message.reply_text("Enter the new Developer Telegram Link/Username (e.g., https://t.me/developer or @developer):")
@@ -5190,7 +6051,7 @@ async def receive_dev_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="withdraw_settings")
 async def admin_add_w_method_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text("Enter new payment method name (e.g., PayTM, Rocket):")
     return WAIT_NEW_WITHDRAW_METHOD
@@ -5206,7 +6067,7 @@ async def receive_new_withdraw_method(update: Update, context: ContextTypes.DEFA
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="withdraw_settings")
 async def admin_set_min_w_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text("Enter new minimum withdraw amount (e.g., 50):")
     return WAIT_MIN_WITHDRAW_AMOUNT
@@ -5226,7 +6087,7 @@ async def receive_min_withdraw_amount(update: Update, context: ContextTypes.DEFA
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="payouts")
 async def admin_reject_w_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     req_id = int(query.data.split(":", 2)[2])
@@ -5268,13 +6129,13 @@ async def receive_reject_reason(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="services")
 async def admin_add_service_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text("Enter the service name (e.g., TikTok, Facebook):")
     return ADD_SERVICE
 
 
-@admin_only
+@admin_only(perm="services")
 async def admin_add_service_with_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     service = _resolve_srv_token(query.data.split(":", 3)[3])
@@ -5286,7 +6147,7 @@ async def admin_add_service_with_name(update: Update, context: ContextTypes.DEFA
     return ADD_COUNTRY
 
 
-@admin_only
+@admin_only(perm="services")
 async def admin_edit_service_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -5326,7 +6187,7 @@ async def receive_edit_service_name(update: Update, context: ContextTypes.DEFAUL
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="services")
 async def admin_country_add_numbers_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -5345,7 +6206,7 @@ async def admin_country_add_numbers_start(update: Update, context: ContextTypes.
     return ADD_NUMBERS
 
 
-@admin_only
+@admin_only(perm="services")
 async def admin_edit_country_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -5432,7 +6293,7 @@ async def receive_edit_country_short(update: Update, context: ContextTypes.DEFAU
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="services")
 async def admin_country_edit_payout_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -5536,17 +6397,19 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if service and country and numbers:
         valid_count = await run_db(save_numbers_sync, service, country, numbers, payout)
         short = get_country_short_sync(service, country)
+        uid_curr = update.effective_user.id if update.effective_user else 0
         await update.message.reply_text(
             f"✅ Successfully added <b>{valid_count}</b> numbers!\n"
             f"🏳️ Country: <b>{safe_html_escape(country)}</b> ({safe_html_escape(short)})\n"
             f"💰 Payout per OTP: <code>{fmt_num(payout)} ৳</code>",
-            reply_markup=get_admin_keyboard(), parse_mode="HTML"
+            reply_markup=get_admin_keyboard(user_id=uid_curr), parse_mode="HTML"
         )
         if return_country:
             text_msg, kbd = build_country_manage_view(service, country)
             await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="HTML")
     else:
-        await update.message.reply_text("Incomplete data provided. Please try again.", reply_markup=get_admin_keyboard())
+        uid_curr = update.effective_user.id if update.effective_user else 0
+        await update.message.reply_text("Incomplete data provided. Please try again.", reply_markup=get_admin_keyboard(user_id=uid_curr))
 
     for key in ('service_name', 'country_name', 'payout_amount', 'cc_length', 'country_short', 'add_numbers_return_country'):
         context.user_data.pop(key, None)
@@ -5554,7 +6417,7 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="admins")
 async def admin_add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.message.reply_text("Enter the Telegram User ID of the new Admin (e.g., 123456789):")
@@ -5579,17 +6442,21 @@ async def receive_admin_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if new_id and admin_name:
         await run_db(add_admin_sync, new_id, admin_name)
-        await update.message.reply_text(f"✅ Admin **{escape_md(admin_name)}** (`{new_id}`) added!", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("❌ Failed to add admin. Incomplete data.")
+        if new_id != ADMIN_ID:
+            await run_db(set_admin_perms_sync, new_id, "custom", {k: False for k, _ in ADMIN_PERMISSIONS})
+        context.user_data.pop('new_admin_id', None)
+        text_msg, kbd = build_admin_role_picker_view(new_id, admin_name)
+        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+        return ConversationHandler.END
 
+    await update.message.reply_text("❌ Failed to add admin. Incomplete data.")
     context.user_data.pop('new_admin_id', None)
     text_msg, kbd = build_admin_control_view()
     await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="api")
 async def admin_add_panel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['panel_flow'] = 'standard'
     if update.callback_query:
@@ -5599,7 +6466,7 @@ async def admin_add_panel_start(update: Update, context: ContextTypes.DEFAULT_TY
     return WAIT_PANEL_NAME
 
 
-@admin_only
+@admin_only(perm="api")
 async def admin_add_custom_panel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['panel_flow'] = 'custom'
     await update.callback_query.message.reply_text(
@@ -5611,7 +6478,7 @@ async def admin_add_custom_panel_start(update: Update, context: ContextTypes.DEF
     return WAIT_PANEL_NAME
 
 
-@admin_only
+@admin_only(perm="api")
 async def admin_add_captcha_panel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['panel_flow'] = 'captcha'
     await update.callback_query.message.reply_text(
@@ -5623,7 +6490,7 @@ async def admin_add_captcha_panel_start(update: Update, context: ContextTypes.DE
     return WAIT_PANEL_NAME
 
 
-@admin_only
+@admin_only(perm="api")
 async def admin_add_augestel_panel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['panel_flow'] = 'augestel'
     await update.callback_query.message.reply_text(
@@ -6086,7 +6953,7 @@ async def _save_captcha_panel(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="extra")
 async def admin_fj_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text(
         "➕ **ADD CHANNEL/GROUP FOR FORCE JOIN**\n\n"
@@ -6174,7 +7041,7 @@ async def handle_fj_chat_type(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="extra")
 async def admin_set_refer_pct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     await update.callback_query.message.reply_text(
@@ -6200,7 +7067,7 @@ async def receive_refer_pct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="links")
 async def set_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.message.reply_text("Enter the new channel link (e.g., https://t.me/your_channel or @your_channel):")
@@ -6219,7 +7086,7 @@ async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="links")
 async def set_support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.message.reply_text("Enter the new support username/link (e.g., @your_support or https://t.me/your_support):")
@@ -6238,7 +7105,7 @@ async def receive_support_link(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="links")
 async def set_otplink_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.message.reply_text("Enter the new OTP Group link (e.g., https://t.me/your_otp_group):")
@@ -6257,7 +7124,7 @@ async def receive_otp_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="links")
 async def set_otpgroupid_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.message.reply_text("Enter the OTP Forward Group Chat ID (e.g., -1001234567890):")
@@ -6276,7 +7143,7 @@ async def receive_otp_group_id(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-@admin_only
+@admin_only(perm="broadcast")
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_users = await run_db(get_all_users)
     await update.message.reply_text(
@@ -6290,12 +7157,12 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_broadcast_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not (await run_db(is_admin_sync, user_id)):
+    if not (await run_db(has_admin_perm_sync, user_id, "broadcast")):
         return ConversationHandler.END
 
     all_users = await run_db(get_all_users)
     if not all_users:
-        await update.message.reply_text("No users found to broadcast.", reply_markup=get_admin_keyboard())
+        await update.message.reply_text("No users found to broadcast.", reply_markup=get_admin_keyboard(user_id=user_id))
         return ConversationHandler.END
 
     total = len(all_users)
@@ -6345,7 +7212,7 @@ async def receive_broadcast_msg(update: Update, context: ContextTypes.DEFAULT_TY
         await status_msg.edit_text(report, parse_mode="Markdown")
     except Exception:
         await update.message.reply_text(report, parse_mode="Markdown")
-    await update.message.reply_text("Select an option from Admin Menu:", reply_markup=get_admin_keyboard())
+    await update.message.reply_text("Select an option from Admin Menu:", reply_markup=get_admin_keyboard(user_id=user_id))
     return ConversationHandler.END
 
 
@@ -6369,6 +7236,40 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+def _has_adm_callback_perm(user_id: int, data: str) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+    if not is_admin_sync(user_id):
+        return False
+    if data == "adm:panel_back":
+        return True
+    if data == "adm:usr:manager":
+        return has_admin_perm_sync(user_id, "users") or has_admin_perm_sync(user_id, "admins")
+    if data.startswith("adm:usr:"):
+        return has_admin_perm_sync(user_id, "users")
+    if data.startswith("adm:ctrl:") or data.startswith("adm:add:") or data.startswith("adm:delconf:") or data.startswith("adm:del:"):
+        return has_admin_perm_sync(user_id, "admins")
+    if data.startswith("adm:srv:") or data.startswith("adm:c:") or data.startswith("adm:cnt:"):
+        return has_admin_perm_sync(user_id, "services")
+    if data.startswith("adm:pay:") or data.startswith("adm:w_page:") or data.startswith("adm:w_view:") or data.startswith("adm:w_app:") or data.startswith("adm:w_rej_start:"):
+        return has_admin_perm_sync(user_id, "payouts")
+    if data.startswith("adm:live:"):
+        return has_admin_perm_sync(user_id, "live_receivers")
+    if data.startswith("adm:set:"):
+        return has_admin_perm_sync(user_id, "links")
+    if data.startswith("adm:api:"):
+        return has_admin_perm_sync(user_id, "api")
+    if data.startswith("adm:setqty:"):
+        return has_admin_perm_sync(user_id, "number_qty")
+    if data in ("adm:w_settings", "adm:w_add_m", "adm:w_set_min", "adm:w_del_m_list", "adm:toggle:withdraw") or data.startswith("adm:w_del_m:"):
+        return has_admin_perm_sync(user_id, "withdraw_settings")
+    if data == "adm:extra_back":
+        return has_admin_perm_sync(user_id, "extra") or has_admin_perm_sync(user_id, "withdraw_settings")
+    if data.startswith("adm:toggle:") or data.startswith("adm:r_") or data.startswith("adm:refer_") or data.startswith("adm:fj_") or data.startswith("adm:cliemoji:"):
+        return has_admin_perm_sync(user_id, "extra")
+    return True
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -6381,6 +7282,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         await query.answer()
         return
+
+    if data.startswith("adm:"):
+        if not user_is_admin:
+            await query.answer("⛔ Unauthorized!", show_alert=True)
+            return
+        if not _has_adm_callback_perm(user_id, data):
+            await query.answer("⛔ Unauthorized! You do not have permission for this action.", show_alert=True)
+            return
 
     if data == "fj_check":
         chats = get_force_join_chats()
@@ -6501,7 +7410,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "adm:extra_back":
         if not user_is_admin: await query.answer(); return
         await query.answer()
-        text_msg, kbd = build_extra_settings_view()
+        text_msg, kbd = build_extra_settings_view(user_id=user_id)
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif data == "adm:fj_settings":
@@ -6552,10 +7461,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user_is_admin: await query.answer(); return
         await query.answer()
         total_users = len(await run_db(get_all_users))
-        panel_text = f"**ADMIN PANEL**\n\n⚙️ DB Mode: **{CURRENT_DB_MODE}**\n👥 Total Users: `{total_users}`"
+        role_lbl = get_admin_role_label(user_id)
+        panel_text = (
+            f"**ADMIN PANEL**\n\n"
+            f"🎭 Role: **{role_lbl}**\n"
+            f"⚙️ DB Mode: **{CURRENT_DB_MODE}**\n"
+            f"👥 Total Users: `{total_users}`"
+        )
         await _reply_with_emoji_fallback(
             query.message,
-            lambda prem: (panel_text, get_admin_keyboard(use_premium=prem)),
+            lambda prem: (panel_text, get_admin_keyboard(use_premium=prem, user_id=user_id)),
             parse_mode="Markdown",
         )
 
@@ -6604,9 +7519,131 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         await _edit_with_emoji_fallback(
             query,
-            lambda prem: build_user_manager_view(use_premium=prem),
+            lambda prem: build_user_manager_view(use_premium=prem, user_id=user_id),
             parse_mode="Markdown",
         )
+
+    elif data == "adm:usr:control":
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: build_user_control_view(use_premium=prem),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("adm:usr:all:"):
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        parts = data.split(":", 4)
+        sort_mode = parts[3] if len(parts) > 3 else "recent"
+        try:
+            page = int(parts[4]) if len(parts) > 4 else 1
+        except ValueError:
+            page = 1
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: build_all_users_view(sort_mode, page, use_premium=prem),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("adm:usr:banned:"):
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        parts = data.split(":", 3)
+        try:
+            page = int(parts[3]) if len(parts) > 3 else 1
+        except ValueError:
+            page = 1
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: build_banned_users_view(page, use_premium=prem),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("adm:usr:inactive:"):
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        parts = data.split(":", 4)
+        win = parts[3] if len(parts) > 3 else "7d"
+        try:
+            page = int(parts[4]) if len(parts) > 4 else 1
+        except ValueError:
+            page = 1
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: build_inactive_users_view(win, page, use_premium=prem),
+            parse_mode="Markdown",
+        )
+
+    elif data == "adm:usr:autoban":
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: build_autoban_settings_view(use_premium=prem),
+            parse_mode="Markdown",
+        )
+
+    elif data == "adm:usr:ab:tog_abuse":
+        if not user_is_admin: await query.answer(); return
+        curr = is_abuse_autoban_enabled()
+        new_val = "false" if curr else "true"
+        await run_db(set_setting, "autoban_abuse_enabled", new_val)
+        await query.answer(
+            f"Abuse Auto-Ban {'enabled' if new_val == 'true' else 'disabled'}!",
+            show_alert=True,
+        )
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: build_autoban_settings_view(use_premium=prem),
+            parse_mode="Markdown",
+        )
+
+    elif data == "adm:usr:ab:tog_inact":
+        if not user_is_admin: await query.answer(); return
+        curr = is_inactive_autoban_enabled()
+        new_val = "false" if curr else "true"
+        await run_db(set_setting, "autoban_inactive_enabled", new_val)
+        await query.answer(
+            f"Inactive Auto-Ban {'enabled' if new_val == 'true' else 'disabled'}!",
+            show_alert=True,
+        )
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: build_autoban_settings_view(use_premium=prem),
+            parse_mode="Markdown",
+        )
+
+    elif data == "adm:usr:ab:run_now":
+        if not user_is_admin: await query.answer(); return
+        if not is_inactive_autoban_enabled():
+            await query.answer("❌ Enable Inactive Auto-Ban first before running sweep.", show_alert=True)
+            return
+        banned_list = await run_db(run_inactive_autoban_sweep_sync)
+        for b in banned_list:
+            await _send_banned_message(context.bot, b["uid"])
+        await query.answer(f"⚡ Auto-banned {len(banned_list)} inactive user(s)!", show_alert=True)
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: build_autoban_settings_view(use_premium=prem),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("adm:usr:view:"):
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        parts = data.split(":", 4)
+        target_uid = int(parts[3])
+        back_tok = parts[4] if len(parts) > 4 else "c"
+        back_cb = _decode_usr_back(back_tok)
+        user_data = await run_db(search_user_sync, str(target_uid))
+        if not user_data:
+            await query.answer("❌ User not found!", show_alert=True)
+            return
+        refer_count = await run_db(get_user_refer_count_sync, target_uid)
+        text, kbd = _build_user_detail_view(target_uid, user_data, back_cb=back_cb, refer_count=refer_count)
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
 
     elif data == "adm:usr:stats":
         if not user_is_admin: await query.answer(); return
@@ -6634,15 +7671,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await _edit_with_emoji_fallback(
             query,
-            lambda prem: ("✅ Export completed. Check the file sent above.", build_user_manager_view(use_premium=prem)[1]),
+            lambda prem: ("✅ Export completed. Check the file sent above.", build_user_manager_view(use_premium=prem, user_id=user_id)[1]),
             parse_mode="Markdown",
         )
 
     elif data.startswith("adm:usr:ban:") or data.startswith("adm:usr:unban:"):
         if not user_is_admin: await query.answer(); return
-        parts = data.split(":", 3)
+        parts = data.split(":", 4)
         action = parts[2]
         target_uid = int(parts[3])
+        back_tok = parts[4] if len(parts) > 4 else "c"
+        back_cb = _decode_usr_back(back_tok)
         if is_admin_sync(target_uid):
             await query.answer("❌ Cannot ban/unban an admin!", show_alert=True)
             return
@@ -6657,7 +7696,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         user_data = await run_db(search_user_sync, str(target_uid))
         if user_data:
-            text, kbd = _build_user_detail_view(target_uid, user_data)
+            refer_count = await run_db(get_user_refer_count_sync, target_uid)
+            text, kbd = _build_user_detail_view(target_uid, user_data, back_cb=back_cb, refer_count=refer_count)
             try:
                 await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
             except Exception:
@@ -6665,13 +7705,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("adm:usr:release:"):
         if not user_is_admin: await query.answer(); return
-        target_uid = int(data.split(":", 3)[3])
+        parts = data.split(":", 4)
+        target_uid = int(parts[3])
+        back_tok = parts[4] if len(parts) > 4 else "c"
+        back_cb = _decode_usr_back(back_tok)
         await query.answer("Releasing numbers...", show_alert=False)
         count = await run_db(release_user_allocations_sync, target_uid)
         await query.answer(f"✅ Released {count} numbers.", show_alert=True)
         user_data = await run_db(search_user_sync, str(target_uid))
         if user_data:
-            text, kbd = _build_user_detail_view(target_uid, user_data)
+            refer_count = await run_db(get_user_refer_count_sync, target_uid)
+            text, kbd = _build_user_detail_view(target_uid, user_data, back_cb=back_cb, refer_count=refer_count)
             try:
                 await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
             except Exception:
@@ -6775,6 +7819,71 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
+    elif data.startswith("adm:ctrl:view:"):
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        target_uid = int(data.split(":", 3)[3])
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: build_admin_detail_view(target_uid, use_premium=prem),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("adm:ctrl:preset:"):
+        if not user_is_admin: await query.answer(); return
+        parts = data.split(":", 4)
+        target_uid = int(parts[3])
+        role_key = parts[4]
+        if target_uid == ADMIN_ID:
+            await query.answer("🔒 Main Owner permissions cannot be changed!", show_alert=True)
+            return
+        await run_db(apply_admin_role_preset_sync, target_uid, role_key)
+        lbl = ADMIN_ROLE_PRESETS.get(role_key, {}).get("label", role_key)
+        await query.answer(f"Role set to {lbl}!")
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: build_admin_detail_view(target_uid, use_premium=prem),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("adm:ctrl:perm:"):
+        if not user_is_admin: await query.answer(); return
+        parts = data.split(":", 4)
+        target_uid = int(parts[3])
+        perm_key = parts[4]
+        if target_uid == ADMIN_ID:
+            await query.answer("🔒 Main Owner permissions cannot be changed!", show_alert=True)
+            return
+        new_state = await run_db(toggle_admin_perm_sync, target_uid, perm_key)
+        await query.answer(f"{perm_key}: {'Enabled' if new_state else 'Disabled'}")
+        await _edit_with_emoji_fallback(
+            query,
+            lambda prem: build_admin_detail_view(target_uid, use_premium=prem),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("adm:add:role:"):
+        if not user_is_admin: await query.answer(); return
+        parts = data.split(":", 4)
+        target_uid = int(parts[3])
+        role_key = parts[4]
+        if target_uid != ADMIN_ID:
+            await run_db(apply_admin_role_preset_sync, target_uid, role_key)
+        lbl = ADMIN_ROLE_PRESETS.get(role_key, {}).get("label", role_key)
+        await query.answer(f"Role set to {lbl}!", show_alert=True)
+        if role_key == "custom":
+            await _edit_with_emoji_fallback(
+                query,
+                lambda prem: build_admin_detail_view(target_uid, use_premium=prem),
+                parse_mode="Markdown",
+            )
+        else:
+            await _edit_with_emoji_fallback(
+                query,
+                lambda prem: build_admin_control_view(use_premium=prem),
+                parse_mode="Markdown",
+            )
+
     elif data.startswith("adm:delconf:"):
         if not user_is_admin: await query.answer(); return
         await query.answer()
@@ -6794,7 +7903,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text,
                 InlineKeyboardMarkup([[
                     _admin_inline_btn("YES, REMOVE", callback_data=f"adm:del:{target_uid}", style="danger", emoji_id="5424998570539373838", fallback_emoji="✅", use_premium=prem),
-                    _admin_inline_btn("CANCEL", callback_data="adm:ctrl:list", style="primary", emoji_id="5456187398977247949", fallback_emoji="◀️", use_premium=prem),
+                    _admin_inline_btn("CANCEL", callback_data=f"adm:ctrl:view:{target_uid}", style="primary", emoji_id="5456187398977247949", fallback_emoji="◀️", use_premium=prem),
                 ]]),
             ),
             parse_mode="Markdown",
@@ -6846,7 +7955,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "adm:toggle:refer":
             text_msg, kbd = build_refer_settings_view()
         else:
-            text_msg, kbd = build_extra_settings_view()
+            text_msg, kbd = build_extra_settings_view(user_id=user_id)
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif data == "adm:toggle:otp_format":
@@ -6858,7 +7967,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"OTP format set to {new_val.upper()}!",
             show_alert=True,
         )
-        text_msg, kbd = build_extra_settings_view()
+        text_msg, kbd = build_extra_settings_view(user_id=user_id)
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif data == "adm:srv:list":
@@ -7426,9 +8535,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             should_ban, change_count = _record_change_and_check_ban(user_id)
             if should_ban:
+                win_s = get_abuse_ban_window()
                 await run_db(
                     set_user_banned_sync, user_id, True,
-                    f"Auto-ban: {change_count} changes in {int(NUMBER_CHANGE_WINDOW)}s",
+                    f"Auto-ban: {change_count} changes in {win_s}s",
                 )
                 _RECENT_NUMBER_CHANGES.pop(user_id, None)
                 _LAST_NUMBER_CLAIM.pop(user_id, None)
@@ -7436,7 +8546,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name = query.from_user.full_name or query.from_user.username or f"User {user_id}"
                 await _notify_admins_ban(
                     context, user_id, name,
-                    f"{change_count} number changes in {int(NUMBER_CHANGE_WINDOW)}s",
+                    f"{change_count} number changes in {win_s}s",
                 )
                 await _send_banned_message(context.bot, user_id)
                 await query.answer(
@@ -8187,6 +9297,7 @@ async def otp_poller_manager(application: Application):
 
     cycle_count = 0
     last_reset_check = 0.0
+    last_inact_sweep = 0.0
 
     while True:
         try:
@@ -8216,6 +9327,13 @@ async def otp_poller_manager(application: Application):
                     logger.error(f"prune error: {e}")
 
             now = time.time()
+            if now - last_inact_sweep >= 3600:
+                last_inact_sweep = now
+                if is_inactive_autoban_enabled():
+                    banned_inact = await run_db(run_inactive_autoban_sweep_sync)
+                    for b in banned_inact:
+                        await _send_banned_message(application.bot, b["uid"])
+
             if now - last_reset_check >= WEEKLY_RESET_CHECK_INTERVAL:
                 last_reset_check = now
                 notifications = await run_db(check_and_process_weekly_reset_sync)
@@ -8289,8 +9407,12 @@ def main():
             CallbackQueryHandler(admin_fj_add_start, pattern="^adm:fj_add$"),
             CallbackQueryHandler(admin_set_refer_pct_start, pattern="^adm:refer_set_pct$"),
             CallbackQueryHandler(admin_search_user_start, pattern="^adm:usr:search$"),
+            CallbackQueryHandler(admin_autoban_thresh_start, pattern="^adm:usr:ab:set_thresh$"),
+            CallbackQueryHandler(admin_autoban_window_start, pattern="^adm:usr:ab:set_win$"),
+            CallbackQueryHandler(admin_autoban_days_start, pattern="^adm:usr:ab:set_days$"),
+            CallbackQueryHandler(admin_autoban_otps_start, pattern="^adm:usr:ab:set_otps$"),
             CallbackQueryHandler(admin_cliemoji_add_start, pattern="^adm:cliemoji:add$"),  # 🆕
-            MessageHandler(filters.Regex("(?i)^Broadcast$"), broadcast_start),
+            MessageHandler(filters.Regex(r"(?i)^(?:[\s\U0001F000-\U0010FFFF\u2600-\u27BF\u25A0-\u25FF\uFE0F\u200D]*)Broadcast$"), broadcast_start),
         ],
         states={
             ADD_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_service_name)],
@@ -8344,6 +9466,10 @@ def main():
             WAIT_FJ_CHAT_TYPE: [CallbackQueryHandler(handle_fj_chat_type, pattern="^adm:fj_type:")],
             WAIT_REFER_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_refer_pct)],
             WAIT_USER_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_user_search)],
+            WAIT_AUTOBAN_THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_autoban_thresh)],
+            WAIT_AUTOBAN_WINDOW: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_autoban_window)],
+            WAIT_AUTOBAN_INACTIVE_DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_autoban_days)],
+            WAIT_AUTOBAN_INACTIVE_OTPS: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_autoban_otps)],
             # 🆕 CLI Emoji States
             WAIT_CLI_EMOJI_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_cli_emoji_name)],
             WAIT_AUG_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_aug_email)],
