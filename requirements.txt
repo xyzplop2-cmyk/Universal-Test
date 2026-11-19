@@ -7,3 +7,4 @@ beautifulsoup4==4.12.3
 httpx==0.28.1
 curl-cffi
 cloudscraper
+playwright==1.42.0
