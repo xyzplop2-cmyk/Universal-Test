@@ -1087,10 +1087,11 @@ async def _process_hybrid_item(panel_id: str, item: dict, context_holder: dict, 
     if queue:
         await queue.put(final_item)
 
-async def _augestel_ws_listener(ws, panel_id: str): # 👈 panel_id যোগ করা হলো
-    """Listens to live-sms websocket payload"""
+def _augestel_ws_listener(ws, panel_id: str):
+    """Listens to live-sms websocket payload (Synchronous callback for Playwright)"""
     logger.info(f"🔗 WebSocket Connected for panel {panel_id} | URL: {ws.url}")
-    async def on_message(payload):
+    
+    def on_message(payload):
         try:
             text = payload if isinstance(payload, str) else payload.decode('utf-8')
             data = json.loads(text)
@@ -1116,9 +1117,9 @@ async def _augestel_ws_listener(ws, panel_id: str): # 👈 panel_id যোগ �
                 "payout": sell_rate,
             }
             
-            # Fixed Context Holder
             ctx = AUGESTEL_SESSIONS.get(str(panel_id), {}).get("state", {})
-            await _process_hybrid_item(str(panel_id), item, ctx, source="WS")
+            # Playwright ইভেন্ট থেকে ডাটা নিয়ে মেইন ফাংশনে পাঠানো হচ্ছে
+            asyncio.create_task(_process_hybrid_item(str(panel_id), item, ctx, source="WS"))
             
         except Exception as e:
             logger.error(f"WS Parse Error: {e}")
@@ -1239,7 +1240,7 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
         page = await context.new_page()
         
         # Start Listening for WebSockets BEFORE navigation
-        page.on("websocket", lambda ws: asyncio.create_task(_augestel_ws_listener(ws, str(panel_id))))
+        page.on("websocket", lambda ws: _augestel_ws_listener(ws, str(panel_id)))
         
         await page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(4000)
@@ -1260,6 +1261,7 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
                 
         await page.goto(dashboard_url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(3000)
+        logger.info(f"✅ Augestel Dashboard loaded for {panel_id}. Waiting for WebSocket frames...")
         
         # Auto Refresh Mechanism (Every 3 hours)
         async def periodic_refresh():
