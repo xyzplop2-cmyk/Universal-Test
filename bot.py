@@ -3532,8 +3532,6 @@ def run_flask():
     WAIT_AUG_EMAIL, WAIT_AUG_PASSWORD, WAIT_AUG_API_KEY,
 ) = range(55)
 
-AUGESTEL_PROCESSED_OTPS = TimedLRUDict(maxsize=100000, ttl=86400)
-
 
 def get_main_keyboard(user_id: int):
     buttons = [
@@ -6850,6 +6848,7 @@ def main():
             WAIT_CLI_EMOJI_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_cli_emoji_name)],
             WAIT_AUG_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_aug_email)],
             WAIT_AUG_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_aug_password)],
+            WAIT_AUG_API_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_aug_api_key)],
             WAIT_CLI_EMOJI_VAL: [MessageHandler(~filters.COMMAND & ~MENU_FILTER, receive_cli_emoji_val)],
         },
         fallbacks=[
