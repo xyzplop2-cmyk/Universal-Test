@@ -1166,7 +1166,47 @@ async def _augestel_api_poller(panel_id: str, api_key: str, interval: float, ctx
             logger.error(f"API Poller Error: {e}")
             
         await asyncio.sleep(interval)
-
+async def _augestel_close_session(panel_id: str):
+    sess = AUGESTEL_SESSIONS.pop(str(panel_id), None)
+    if not sess:
+        return
+    try:
+        page = sess.get("page")
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        ctx = sess.get("context")
+        if ctx:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        browser = sess.get("browser")
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        pw = sess.get("pw")
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    
 async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, str]:
     if not HAS_PLAYWRIGHT_LIB:
         return False, "Playwright not installed"
