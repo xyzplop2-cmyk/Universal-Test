@@ -1274,18 +1274,29 @@ async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, 
         logger.info(f"✅ Augestel Dashboard loaded for {panel_id}. Waiting for WebSocket frames...")
         
         # Auto Refresh Mechanism (Every 3 hours)
+               # Auto Refresh Mechanism (Every 3 MINUTES - WebSocket keepalive)
         async def periodic_refresh():
             while AUGESTEL_SESSIONS.get(str(panel_id)):
-                await asyncio.sleep(10800) # 3 hours
-                logger.info(f"Refreshing Augestel Page for {panel_id}")
+                await asyncio.sleep(180)  # 3 minutes
+                sess = AUGESTEL_SESSIONS.get(str(panel_id))
+                if not sess:
+                    break
                 try:
-                    p = AUGESTEL_SESSIONS.get(str(panel_id), {}).get("page")
-                    if p:
-                        await p.reload(wait_until="domcontentloaded")
-                except Exception as e:
-                    logger.error(f"Auto Refresh failed: {e}")
+                    p = sess.get("page")
+                    if not p:
+                        break
+                    logger.info(f"🔄 Periodic WS keepalive reload for {panel_id}")
+                    await p.reload(wait_until="domcontentloaded", timeout=30000)
+                    await p.wait_for_timeout(3000)
                     
-        asyncio.create_task(periodic_refresh())
+                    # Check if session expired during reload
+                    current_url = (p.url or "").lower()
+                    if "login" in current_url or "signin" in current_url:
+                        logger.warning(f"⚠️ Session expired after reload for {panel_id}, forcing re-login")
+                        await _augestel_close_session(panel_id)
+                        break
+                except Exception as e:
+                    logger.error(f"Periodic refresh failed for {panel_id}: {e}")
         
         # Queue for unified processing
         otp_queue = asyncio.Queue()
