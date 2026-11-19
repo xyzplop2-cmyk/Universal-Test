@@ -1,4 +1,4 @@
-# Update V2
+# Update V4 e
 import asyncio
 import logging
 import os
@@ -6,7 +6,6 @@ import re
 import json
 import base64
 import hashlib
-import hmac
 import html
 import time
 import datetime
@@ -30,8 +29,18 @@ try:
 except ImportError:
     HAS_FIREBASE_LIB = False
 
-from flask import Flask, jsonify, request
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, LinkPreviewOptions
+try:
+    from playwright.async_api import async_playwright
+    HAS_PLAYWRIGHT_LIB = True
+except ImportError:
+    HAS_PLAYWRIGHT_LIB = False
+
+from flask import Flask, jsonify
+from telegram import (
+    Update, ReplyKeyboardMarkup, InlineKeyboardMarkup,
+    LinkPreviewOptions, Message, KeyboardButton, InlineKeyboardButton,
+    MessageEntity,
+)
 from telegram.error import RetryAfter
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -82,6 +91,11 @@ API_FETCH_TIMEOUT = 8.0
 PANEL_INFO_CACHE_TTL = 60
 API_RECORDS_PER_POLL = 200
 
+# 🛡️ ANTI-ABUSE SYSTEM
+NUMBER_CLAIM_COOLDOWN = 5.0
+NUMBER_CHANGE_WINDOW = 25.0
+NUMBER_CHANGE_BAN_THRESHOLD = 3
+
 SETTINGS_CACHE = {}
 SERVICES_CACHE = {}
 PAYOUTS_CACHE = {}
@@ -96,19 +110,24 @@ _NEXT_BROADCAST_SEND_AT = 0.0
 _BOT_INFO_CACHE: Dict[str, Any] = {"username": None, "link": "https://t.me", "ts": 0.0}
 _PANEL_INFO_CACHE: Dict[str, Dict[str, Any]] = {}
 
+# 🛡️ ANTI-ABUSE STATE
+_LAST_NUMBER_CLAIM: Dict[int, float] = {}
+_RECENT_NUMBER_CHANGES: Dict[int, list] = {}
+_IN_MEMORY_BANNED: set = set()
+_IN_MEMORY_BAN_REASONS: Dict[int, str] = {}
+_NOT_BANNED_CACHE: Dict[int, float] = {}
+_NOT_BANNED_CACHE_TTL = 60.0
+
 # 🔐 CAPTCHA PANEL
 CAPTCHA_SESSIONS: Dict[str, dict] = {}
 CAPTCHA_PANEL_STATUS: Dict[str, str] = {}
-
+AUGESTEL_SESSIONS: Dict[str, dict] = {}
 AUGESTEL_PANEL_STATUS: Dict[str, str] = {}
-AUGESTEL_PANEL_COUNTS: Dict[str, int] = {}
-_AUGESTEL_PANELS_CACHE: Dict[str, Any] = {"panels": [], "ts": 0.0, "loaded": False}
-_MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
-_BOT_APP: Optional[Application] = None
-_POLLER_READY_EVENT: Optional[asyncio.Event] = None
-_SHARED_PROCESSED_IDS: Optional[Any] = None
-_DETECTED_BASE_URL: str = ""
-_DETECTED_PUBLIC_IP: str = ""
+AUGESTEL_LOGIN_URL = "https://augestel.com/Switchfy"
+AUGESTEL_DASHBOARD_URL = "https://augestel.com/Switchfy/client/live-sms"
+AUGESTEL_TERMINATIONS_PATH = "/Switchfy/client/sms-statistics/terminations"
+AUGESTEL_NUMBERS_PATH = "/Switchfy/client/sms-statistics/numbers"
+AUGESTEL_MESSAGES_PATH = "/Switchfy/client/sms-statistics/messages"
 
 # 🔒 FORCE JOIN CACHE
 _FORCE_JOIN_CACHE: Dict[int, float] = {}
@@ -200,6 +219,33 @@ async def _safe_send_api(bot, chat_id: int, api_method: str, **kwargs) -> bool:
 
 async def _safe_send(bot, chat_id: int, **kwargs) -> bool:
     return await _safe_send_api(bot, chat_id, "send_message", **kwargs)
+
+
+async def _safe_send_rich(bot, chat_id: int, html_content: str,
+                          reply_markup=None, disable_web_page_preview: bool = True) -> bool:
+    """Send a Telegram Rich Message (Bot API 10.1+). Falls back gracefully."""
+    api_kwargs: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "rich_message": {"html": html_content},
+    }
+    if reply_markup is not None:
+        try:
+            api_kwargs["reply_markup"] = reply_markup.to_dict()
+        except Exception:
+            pass
+    if disable_web_page_preview:
+        api_kwargs["link_preview_options"] = {"is_disabled": True}
+
+    try:
+        await bot.do_api_request(
+            "send_rich_message",
+            api_kwargs=api_kwargs,
+            return_type=Message,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"send_rich_message failed for {chat_id}: {e}")
+        return False
 
 
 class LRUSet:
@@ -305,7 +351,73 @@ def escape_md(text: str) -> str:
         return ""
     return str(text).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
 
+def remove_emojis(text: str) -> str:
+    if not text:
+        return ""
+    import re
+    emoji_pattern = re.compile("["
+        u"\U0001F600-\U0001F64F"  # emoticons
+        u"\U0001F300-\U0001F5FF"  # symbols & pictographs
+        u"\U0001F680-\U0001F6FF"  # transport & map symbols
+        u"\U0001F1E0-\U0001F1FF"  # flags (iOS)
+        u"\U00002702-\U000027B0"
+        u"\U000024C2-\U0001F251"
+        "]+", flags=re.UNICODE)
+    return emoji_pattern.sub(r'', text).strip()
 
+def entities_to_tg_emoji(text: str, entities: list) -> str:
+    """Converts premium emoji entities to <tg-emoji> HTML tags."""
+    if not text or not entities:
+        return text or ""
+    
+    # Sort entities by offset descending to avoid index shifting
+    valid_ents = [e for e in entities if e.type == MessageEntity.CUSTOM_EMOJI]
+    if not valid_ents:
+        return text
+    
+    valid_ents.sort(key=lambda e: e.offset, reverse=True)
+    text_bytes = text.encode('utf-16-le')
+    
+    for entity in valid_ents:
+        start = entity.offset * 2
+        end = (entity.offset + entity.length) * 2
+        fallback = text_bytes[start:end].decode('utf-16-le', errors='ignore')
+        tag = f'<tg-emoji emoji-id="{entity.custom_emoji_id}">{fallback}</tg-emoji>'
+        text_bytes = text_bytes[:start] + tag.encode('utf-16-le') + text_bytes[end:]
+    
+    return text_bytes.decode('utf-16-le', errors='ignore')
+
+
+def safe_html_escape(text: str) -> str:
+    """HTML escape but preserve <tg-emoji> tags."""
+    if not text:
+        return ""
+    parts = re.split(r'(<tg-emoji emoji-id="\d+">.*?</tg-emoji>)', str(text))
+    return "".join(p if p.startswith("<tg-emoji") else html.escape(p) for p in parts)
+
+
+def strip_all_emojis(text: str) -> str:
+    """Strip both tg-emoji tags and regular emojis."""
+    if not text:
+        return ""
+    t = re.sub(r'<tg-emoji.*?</tg-emoji>', '', str(text))
+    return remove_emojis(t).strip()
+
+
+def _cb_clean(name: str) -> str:
+    """Clean name for callback_data (removes tg-emoji to fit 64-byte limit)."""
+    if not name:
+        return ""
+    return re.sub(r'<tg-emoji.*?</tg-emoji>', '', str(name)).strip()
+
+
+def _resolve_full_key(clean: str, keys) -> str:
+    """Find full key (with tg-emoji) that matches clean name."""
+    for k in keys:
+        if _cb_clean(k) == clean:
+            return k
+    return clean
+        
 def clean_tg_link(val: str) -> str:
     if not val:
         return "https://t.me"
@@ -333,17 +445,40 @@ def extract_otp(text: str) -> str:
 
 
 def create_button(text: str, callback_data: str = None, url: str = None,
-                  copy_text: str = None, style: str = None) -> dict:
-    btn = {"text": str(text).upper() if text else ""}
+                  copy_text: str = None, style: str = None, icon_custom_emoji_id: str = None) -> InlineKeyboardButton:
+    final_text = str(text) if text else ""
+    extracted_id = None
+
+    match = re.search(r'<tg-emoji emoji-id="(\d+)">(.*?)</tg-emoji>', final_text)
+    if match:
+        prefix = final_text[:match.start()]
+        if not prefix.strip():
+            # Tag শুরুতেই → icon হিসেবে সেট হবে, text থেকে সম্পূর্ণ সরানো হবে
+            extracted_id = match.group(1)
+            final_text = final_text[match.end():]
+            # বাকি থাকা tg-emoji tag → fallback emoji-তে কনভার্ট
+            final_text = re.sub(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>',
+                                r'\1', final_text).strip()
+        else:
+            # Tag মাঝখানে → শুধু fallback emoji-তে কনভার্ট, icon সেট হবে না
+            final_text = re.sub(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>',
+                                r'\1', final_text)
+
+    kwargs = {"text": final_text}
     if callback_data:
-        btn["callback_data"] = callback_data
+        kwargs["callback_data"] = callback_data
     if url:
-        btn["url"] = url
+        kwargs["url"] = url
     if copy_text:
-        btn["copy_text"] = {"text": copy_text}
+        kwargs["copy_text"] = {"text": copy_text}
     if style:
-        btn["style"] = style
-    return btn
+        kwargs["style"] = style
+
+    final_emoji = icon_custom_emoji_id or extracted_id
+    if final_emoji:
+        kwargs["icon_custom_emoji_id"] = final_emoji
+
+    return InlineKeyboardButton(**kwargs)
 
 
 def mask_number_aph(num_str: str) -> str:
@@ -351,6 +486,25 @@ def mask_number_aph(num_str: str) -> str:
     if len(num_str) > 6:
         return num_str[:-6] + "APH" + num_str[-3:]
     return num_str
+
+
+def mask_number_premium(num_str: str) -> Tuple[str, str]:
+    """Returns (prefix_mask, number_mask) for the rich table rows."""
+    digits = re.sub(r'\D', '', str(num_str))
+    if not digits:
+        return "XXXX", "+......XX"
+    
+    n = len(digits)
+    if n <= 5:
+        # Fallback for very short numbers
+        return digits[:1] + "XXXX", "+" + digits[:1] + "......" + digits[-2:]
+        
+    # +213......70 format (First 3 digits + 6 dots + Last 2 digits)
+    prefix = digits[:3]
+    last_two = digits[-2:]
+    number_mask = f"+{prefix}.............{last_two}"
+    
+    return "XXXX", number_mask
 
 
 def mask_api_key(key: str) -> str:
@@ -371,12 +525,193 @@ async def run_db(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
+def admin_only(func):
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        query = update.callback_query
+        user = update.effective_user
+        if query:
+            try:
+                await query.answer()
+            except Exception:
+                pass
+        if not user or not (await run_db(is_admin_sync, user.id)):
+            return ConversationHandler.END
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+
+# ============================================================
+# 🛡️ ANTI-ABUSE HELPERS
+# ============================================================
+BANNED_TEXT = (
+    "🚫 <b>You have been banned</b>\n\n"
+    "You cannot get numbers or withdraw while banned.\n\n"
+    "Please contact support to resolve this."
+)
+
+
+def _banned_keyboard():
+    sp = clean_tg_link(get_setting("support", ""))
+    buttons = []
+    if sp and sp != "https://t.me":
+        buttons.append([create_button("🎧 Contact Support", url=sp, style="primary")])
+    return InlineKeyboardMarkup(buttons) if buttons else None
+
+
+def is_user_banned_sync(user_id: int) -> bool:
+    if user_id in _IN_MEMORY_BANNED:
+        return True
+    now = time.time()
+    ts = _NOT_BANNED_CACHE.get(user_id)
+    if ts and (now - ts) < _NOT_BANNED_CACHE_TTL:
+        return False
+    try:
+        res = supabase.table("users").select("is_banned").eq("user_id", user_id).limit(1).execute()
+        if res.data:
+            banned = bool(res.data[0].get("is_banned", False))
+            if banned:
+                _IN_MEMORY_BANNED.add(user_id)
+                _NOT_BANNED_CACHE.pop(user_id, None)
+            else:
+                _NOT_BANNED_CACHE[user_id] = now
+            return banned
+        _NOT_BANNED_CACHE[user_id] = now
+        return False
+    except Exception as e:
+        logger.debug(f"is_user_banned_sync error: {e}")
+        _NOT_BANNED_CACHE[user_id] = now
+    return False
+
+
+def set_user_banned_sync(user_id: int, banned: bool, reason: str = "") -> bool:
+    if banned:
+        _IN_MEMORY_BANNED.add(user_id)
+        if reason:
+            _IN_MEMORY_BAN_REASONS[user_id] = reason
+        _NOT_BANNED_CACHE.pop(user_id, None)
+    else:
+        _IN_MEMORY_BANNED.discard(user_id)
+        _IN_MEMORY_BAN_REASONS.pop(user_id, None)
+        _NOT_BANNED_CACHE[user_id] = time.time()
+
+    update_data = {"is_banned": banned, "dirty": True}
+    if reason:
+        update_data["ban_reason"] = reason
+    try:
+        supabase.table("users").update(update_data).eq("user_id", user_id).execute()
+        return True
+    except Exception:
+        try:
+            supabase.table("users").update({
+                "is_banned": banned, "dirty": True,
+            }).eq("user_id", user_id).execute()
+            return True
+        except Exception as e2:
+            logger.warning(
+                f"Ban NOT persisted in DB ({e2}). Add 'is_banned' (bool) and "
+                f"'ban_reason' (text) columns to 'users' table for persistence."
+            )
+            return True
+
+
+def _check_number_cooldown(user_id: int) -> Tuple[bool, int]:
+    if len(_LAST_NUMBER_CLAIM) > 50000:
+        _LAST_NUMBER_CLAIM.clear()
+    now = time.monotonic()
+    last = _LAST_NUMBER_CLAIM.get(user_id)
+    if last is not None:
+        elapsed = now - last
+        if elapsed < NUMBER_CLAIM_COOLDOWN:
+            return False, int(NUMBER_CLAIM_COOLDOWN - elapsed) + 1
+    return True, 0
+
+
+def _record_change_and_check_ban(user_id: int) -> Tuple[bool, int]:
+    if len(_RECENT_NUMBER_CHANGES) > 50000:
+        _RECENT_NUMBER_CHANGES.clear()
+    now = time.monotonic()
+    cutoff = now - NUMBER_CHANGE_WINDOW
+    lst = [t for t in _RECENT_NUMBER_CHANGES.get(user_id, []) if t >= cutoff]
+    lst.append(now)
+    _RECENT_NUMBER_CHANGES[user_id] = lst
+    return len(lst) >= NUMBER_CHANGE_BAN_THRESHOLD, len(lst)
+
+
+async def _notify_admins_ban(context: ContextTypes.DEFAULT_TYPE,
+                              user_id: int, name: str, reason: str):
+    msg = (
+        f"🚫 <b>AUTO-BAN TRIGGERED</b>\n\n"
+        f"👤 User: <a href=\"tg://user?id={user_id}\">{html.escape(name)}</a>\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"📝 Reason: {html.escape(reason)}\n\n"
+        f"To unban: <b>User Manager → Search User</b>"
+    )
+    targets = set()
+    if ADMIN_ID:
+        targets.add(ADMIN_ID)
+    targets.update(ADMINS_CACHE)
+    for admin_id in targets:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=msg, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"Ban notify to admin {admin_id} failed: {e}")
+
+
+async def _send_banned_message(bot, chat_id: int):
+    try:
+        await bot.send_message(
+            chat_id=chat_id, text=BANNED_TEXT,
+            reply_markup=_banned_keyboard(), parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning(f"send banned msg failed: {e}")
+
+
+def release_user_allocations_sync(user_id: int) -> int:
+    try:
+        rows = fetch_all_rows("allocations", "number, service, country",
+                              filters={"user_id": user_id})
+        if not rows:
+            return 0
+
+        groups: dict = {}
+        for r in rows:
+            key = (r["service"], r["country"])
+            groups.setdefault(key, []).append(r["number"])
+
+        for (srv, cnt), nums in groups.items():
+            for i in range(0, len(nums), 200):
+                chunk = nums[i:i + 200]
+                try:
+                    supabase.table("numbers").update({
+                        "status": "available", "user_id": 0,
+                    }).eq("service", srv).eq("country", cnt).in_("number", chunk).execute()
+                except Exception as e:
+                    logger.error(f"release nums update error: {e}")
+
+        supabase.table("allocations").delete().eq("user_id", user_id).execute()
+
+        if firebase_db_ref:
+            try:
+                updates = {}
+                for r in rows:
+                    updates[f"allocations/{r['number']}"] = None
+                firebase_db_ref.reference("/").update(updates)
+            except Exception:
+                pass
+
+        refresh_services_cache_sync()
+        return len(rows)
+    except Exception as e:
+        logger.error(f"release_user_allocations_sync error: {e}")
+        return 0
+
+
 # ============================================================
 # 🔐 AUTO CAPTCHA PANEL — Helpers & Session Store
 # ============================================================
 def get_panel_type(panel: dict) -> str:
-    if str(panel.get("url") or "").startswith("webhook://augestel"):
-        return "augestel"
     mj = panel.get("mapping_json") or ""
     if not mj:
         return "api"
@@ -391,89 +726,6 @@ def get_panel_type(panel: dict) -> str:
     except Exception:
         pass
     return "api"
-
-
-def _get_augestel_secret(panel: dict) -> str:
-    mj = panel.get("mapping_json") or ""
-    if mj:
-        try:
-            m = json.loads(mj)
-            if isinstance(m, dict) and m.get("webhook_secret"):
-                return str(m["webhook_secret"]).strip()
-        except Exception:
-            pass
-    return str(panel.get("token") or "").strip()
-
-
-def _verify_augestel_signature(raw_body: bytes, secret: str, sig_header: str) -> bool:
-    if not secret or not sig_header:
-        return False
-    digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    expected = f"sha256={digest}"
-    return hmac.compare_digest(expected, sig_header.strip())
-
-
-def _get_webhook_base_url() -> str:
-    saved_base = (get_setting("webhook_base_url", "") or "").strip().rstrip("/")
-    if saved_base:
-        if not saved_base.startswith(("http://", "https://")):
-            saved_base = f"https://{saved_base}"
-        return saved_base
-    for env_key in (
-        "WEBHOOK_BASE_URL", "PUBLIC_URL", "BASE_URL",
-        "RENDER_EXTERNAL_URL", "APP_URL", "SERVER_URL", "RAILWAY_STATIC_URL",
-    ):
-        val = (os.environ.get(env_key) or "").strip().rstrip("/")
-        if val:
-            if not val.startswith(("http://", "https://")):
-                val = f"https://{val}"
-            return val
-    for domain_key in (
-        "RENDER_EXTERNAL_HOSTNAME", "RAILWAY_PUBLIC_DOMAIN",
-        "KOYEB_PUBLIC_DOMAIN", "SPACE_HOST", "REPLIT_DEV_DOMAIN",
-    ):
-        val = (os.environ.get(domain_key) or "").strip().rstrip("/")
-        if val:
-            return f"https://{val}"
-    fly_app = (os.environ.get("FLY_APP_NAME") or "").strip()
-    if fly_app:
-        return f"https://{fly_app}.fly.dev"
-    heroku_app = (os.environ.get("HEROKU_APP_NAME") or "").strip()
-    if heroku_app:
-        return f"https://{heroku_app}.herokuapp.com"
-    if _DETECTED_BASE_URL:
-        return _DETECTED_BASE_URL.rstrip("/")
-    if _DETECTED_PUBLIC_IP:
-        port = str(os.environ.get("PORT", "8080")).strip()
-        if port in ("80", ""):
-            return f"http://{_DETECTED_PUBLIC_IP}"
-        if port == "443":
-            return f"https://{_DETECTED_PUBLIC_IP}"
-        return f"http://{_DETECTED_PUBLIC_IP}:{port}"
-    return ""
-
-
-def _get_augestel_endpoint_url(panel_id: Optional[str] = None) -> str:
-    path = f"/webhook/augestel/{panel_id}" if panel_id else "/webhook/augestel"
-    base = _get_webhook_base_url()
-    if base:
-        return f"{base}{path}".replace("`", "")
-    return f"https://your-domain.com{path}"
-
-
-async def _detect_public_ip_once() -> None:
-    global _DETECTED_PUBLIC_IP
-    if _get_webhook_base_url():
-        return
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get("https://api.ipify.org")
-            if r.status_code == 200:
-                ip = r.text.strip()
-                if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", ip):
-                    _DETECTED_PUBLIC_IP = ip
-    except Exception:
-        pass
 
 
 def _solve_captcha_from_html(html_text: str, soup: BeautifulSoup) -> str:
@@ -791,6 +1043,252 @@ async def fetch_captcha_panel_data(panel_id: str, cfg: dict) -> Tuple[list, str]
 
     except Exception as e:
         return [], f"❌ Fetch error: {str(e)[:80]}"
+
+def _make_otp_hash(number: str, msg: str, dt: str) -> str:
+    """Creates a unique hash for deduplication"""
+    # Clean dt to only digits (removes spaces, -, :, T, Z)
+    clean_dt = re.sub(r'\D', '', str(dt))
+    raw = f"{number}|{msg[:100]}|{clean_dt}"
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+async def _process_hybrid_item(panel_id: str, item: dict, context_holder: dict):
+    """Processes items from either WebSocket or API, handles deduplication."""
+    num = re.sub(r'\D', '', str(item.get("num", "")))
+    msg = str(item.get("message", "")).strip()
+    dt = str(item.get("dt", ""))
+    cli = str(item.get("cli", ""))
+    payout = item.get("payout", 1)
+    
+    if not num or not msg:
+        return
+
+    # Deduplication Check
+    otp_hash = _make_otp_hash(num, msg, dt)
+    if otp_hash in AUGESTEL_PROCESSED_OTPS:
+        return # Already processed (either via WS or API)
+    
+    AUGESTEL_PROCESSED_OTPS.add(otp_hash)
+    
+    # Prepare item for the main OTP processor
+    final_item = {
+        "num": num,
+        "message": msg,
+        "dt": dt,
+        "payout": payout,
+        "cli": cli,
+        "panel_id": panel_id,
+    }
+    
+    # Push to queue (which the main bot loop reads)
+    queue = context_holder.get("queue")
+    if queue:
+        await queue.put(final_item)
+
+async def _augestel_ws_listener(ws):
+    """Listens to live-sms websocket payload"""
+    async def on_message(payload):
+        try:
+            text = payload if isinstance(payload, str) else payload.decode('utf-8')
+            data = json.loads(text)
+            
+            # Filter for new_message type only
+            if data.get("type") != "new_message":
+                return
+                
+            msg_data = data.get("data", {})
+            raw_num = str(msg_data.get("destination_address") or "")
+            msg_content = str(msg_data.get("message_content") or "")
+            timestamp = str(msg_data.get("timestamp") or "")
+            source_cli = str(msg_data.get("source_address") or "")
+            sell_rate = str(msg_data.get("sell_rate") or "1")
+            
+            if not raw_num or not msg_content:
+                return
+                
+            item = {
+                "num": raw_num,
+                "message": msg_content,
+                "dt": timestamp,
+                "cli": source_cli,
+                "payout": sell_rate,
+            }
+            
+            # Call processor
+            panel_id = getattr(ws, "_panel_id", None)
+            ctx = AUGESTEL_SESSIONS.get(str(panel_id), {})
+            await _process_hybrid_item(str(panel_id), item, ctx)
+            
+        except Exception as e:
+            logger.error(f"WS Parse Error: {e}")
+
+    ws.on("framereceived", on_message)
+
+async def _augestel_api_poller(panel_id: str, api_key: str, interval: float, ctx_holder: dict):
+    """Runs in background, polls API every X seconds as backup"""
+    url = "https://augestel.com/api/v1/iprn/messages"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json"
+    }
+    
+    while AUGESTEL_SESSIONS.get(str(panel_id)):
+        try:
+            today = datetime.datetime.now().strftime("%Y-%m-%d")
+            params = {
+                "start_date": today,
+                "end_date": today,
+                "per_page": 200
+            }
+            
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.get(url, headers=headers, params=params)
+                
+                if res.status_code == 429:
+                    retry_after = int(res.headers.get("Retry-After", 15))
+                    logger.warning(f"API Rate limit hit. Waiting {retry_after}s")
+                    await asyncio.sleep(retry_after)
+                    continue
+                    
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get("success"):
+                        for msg in data.get("data", []):
+                            item = {
+                                "num": str(msg.get("number", "")),
+                                "message": str(msg.get("message", "")),
+                                "dt": str(msg.get("received_at", "")),
+                                "cli": str(msg.get("source", "")),
+                                "payout": str(msg.get("rate", "1"))
+                            }
+                            await _process_hybrid_item(str(panel_id), item, ctx_holder)
+                            
+        except Exception as e:
+            logger.error(f"API Poller Error: {e}")
+            
+        await asyncio.sleep(interval)
+
+async def _augestel_login(panel_id: str, panel: dict, cfg: dict) -> Tuple[bool, str]:
+    if not HAS_PLAYWRIGHT_LIB:
+        return False, "Playwright not installed"
+    
+    email = str(cfg.get("email") or "").strip()
+    password = str(cfg.get("password") or "")
+    api_key = str(cfg.get("api_key") or "")
+    login_url = str(cfg.get("login_url") or AUGESTEL_LOGIN_URL).strip()
+    dashboard_url = str(cfg.get("dashboard_url") or AUGESTEL_DASHBOARD_URL).strip()
+    
+    if not email or not password:
+        return False, "Missing email or password"
+        
+    await _augestel_close_session(panel_id)
+    pw = None
+    browser = None
+    
+    try:
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+        )
+        page = await context.new_page()
+        
+        # Start Listening for WebSockets BEFORE navigation
+        page.on("websocket", lambda ws: asyncio.create_task(_augestel_ws_listener(ws)))
+        
+        await page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(4000)
+        
+        email_input = page.get_by_placeholder("you@company.com").or_(page.get_by_label("Email address")).or_(page.locator("input:visible").nth(0)).first
+        password_input = page.locator('input[type="password"]:visible').or_(page.get_by_label("Password")).first
+        
+        await email_input.wait_for(state="visible", timeout=30000)
+        await email_input.fill(email)
+        await password_input.fill(password)
+        await page.get_by_role("button", name="Sign in").click()
+        
+        try:
+            await page.wait_for_url("**/Switchfy/test/**", timeout=60000)
+        except Exception:
+            if page.url.rstrip("/") == login_url.rstrip("/"):
+                raise RuntimeError("Login failed. Still on login page")
+                
+        await page.goto(dashboard_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(3000)
+        
+        # Auto Refresh Mechanism (Every 3 hours)
+        async def periodic_refresh():
+            while AUGESTEL_SESSIONS.get(str(panel_id)):
+                await asyncio.sleep(10800) # 3 hours
+                logger.info(f"Refreshing Augestel Page for {panel_id}")
+                try:
+                    p = AUGESTEL_SESSIONS.get(str(panel_id), {}).get("page")
+                    if p:
+                        await p.reload(wait_until="domcontentloaded")
+                except Exception as e:
+                    logger.error(f"Auto Refresh failed: {e}")
+                    
+        asyncio.create_task(periodic_refresh())
+        
+        # Queue for unified processing
+        otp_queue = asyncio.Queue()
+        state = {
+            "queue": otp_queue,
+            "raw_items_queue": otp_queue
+        }
+        
+        AUGESTEL_SESSIONS[str(panel_id)] = {
+            "pw": pw,
+            "browser": browser,
+            "context": context,
+            "page": page,
+            "state": state,
+            "last_login": time.time(),
+        }
+        
+        # Start the API Poller as Backup
+        if api_key:
+            p_interval = panel.get("polling_interval", 13.0)
+            asyncio.create_task(_augestel_api_poller(str(panel_id), api_key, p_interval, state))
+            
+        return True, "Active & Fetching (WS + API)"
+        
+    except Exception as e:
+        try:
+            if browser: await browser.close()
+            if pw: await pw.stop()
+        except Exception:
+            pass
+        return False, f"Error: {str(e)[:80]}"
+
+async def fetch_augestel_panel_data(panel_id: str, cfg: dict) -> Tuple[list, str]:
+    """This function is called by the main loop to get new OTPs"""
+    sess = AUGESTEL_SESSIONS.get(str(panel_id))
+    if not sess:
+        ok, status = await _augestel_login(str(panel_id), {}, cfg)
+        if not ok:
+            return [], status
+        sess = AUGESTEL_SESSIONS.get(str(panel_id))
+        if not sess:
+            return [], "Login failed"
+            
+    try:
+        queue = sess.get("state", {}).get("queue")
+        items = []
+        
+        # Empty the queue (non-blocking)
+        while not queue.empty():
+            try:
+                items.append(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+                
+        return items, "Active & Fetching"
+    except Exception as e:
+        return [], f"Fetch error: {str(e)[:80]}"
 
 
 def _get_json_path(obj, path):
@@ -1367,8 +1865,6 @@ def save_api_panel_sync(name: str, url: str, token: str,
             except Exception:
                 pass
         _PANEL_INFO_CACHE.pop(str(pid), None)
-        _AUGESTEL_PANELS_CACHE["loaded"] = False
-        _AUGESTEL_PANELS_CACHE["ts"] = 0.0
         return pid
     except Exception as e:
         logger.error(f"Supabase save API panel error: {e}")
@@ -1379,8 +1875,6 @@ def delete_api_panel_sync(panel_id: str):
     try:
         supabase.table("api_panels").delete().eq("id", int(panel_id)).execute()
         _PANEL_INFO_CACHE.pop(str(panel_id), None)
-        _AUGESTEL_PANELS_CACHE["loaded"] = False
-        _AUGESTEL_PANELS_CACHE["ts"] = 0.0
         if firebase_db_ref:
             firebase_db_ref.reference(f"api_panels/{panel_id}").delete()
     except Exception as e:
@@ -1396,7 +1890,13 @@ def delete_api_panel_sync(panel_id: str):
             pass
     CAPTCHA_PANEL_STATUS.pop(str(panel_id), None)
     AUGESTEL_PANEL_STATUS.pop(str(panel_id), None)
-    AUGESTEL_PANEL_COUNTS.pop(str(panel_id), None)
+    if str(panel_id) in AUGESTEL_SESSIONS:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.run_coroutine_threadsafe(_augestel_close_session(str(panel_id)), loop)
+        except Exception:
+            pass
 
 
 def get_setting(key: str, default_val: str = "") -> str:
@@ -1420,7 +1920,6 @@ def set_setting(key: str, value: str):
 # 🆕 COUNTRY SHORT-NAME HELPERS
 # ============================================================
 def get_country_short_sync(service: str, country: str) -> str:
-    """Return short-form for a service/country pair. Falls back to country name."""
     if not service or not country:
         return country or ""
     val = get_setting(f"country_short:{service}:{country}", "")
@@ -1824,7 +2323,6 @@ def check_and_process_weekly_reset_sync() -> list:
 
 
 def get_ranking_leaderboard_sync(user_id: int) -> str:
-    """Build leaderboard. User name is clickable ONLY if viewer is admin."""
     now = time.time()
     top_5 = None
     if LEADERBOARD_CACHE["data"] is not None and now - LEADERBOARD_CACHE["ts"] < LEADERBOARD_CACHE_TTL:
@@ -1853,7 +2351,6 @@ def get_ranking_leaderboard_sync(user_id: int) -> str:
     except Exception as e:
         logger.error(f"Supabase user rank error: {e}")
 
-    # 🆕 Only admins can click on user names to open their profile
     viewer_is_admin = is_admin_sync(user_id)
 
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
@@ -2208,7 +2705,15 @@ def save_numbers_sync(service: str, country: str, numbers: list, payout: float =
         except Exception as e:
             logger.error(f"Firebase mirror numbers error: {e}")
 
-    refresh_services_cache_sync()
+    try:
+        if service not in SERVICES_CACHE:
+            SERVICES_CACHE[service] = {}
+        if country not in SERVICES_CACHE[service]:
+            SERVICES_CACHE[service][country] = 0
+        SERVICES_CACHE[service][country] += inserted
+    except Exception as e:
+        logger.warning(f"incremental cache update failed: {e}")
+
     return inserted
 
 
@@ -2317,19 +2822,19 @@ def build_admin_control_view():
         role_label = "👑 Main Owner" if is_owner else "🛡️ Admin"
         text += f"\n• **{escape_md(name)}** (`{uid}`) - {role_label}"
         if not is_owner:
-            buttons.append([create_button(f"🗑️ Remove {name}", callback_data=f"adm:delconf:{uid}", style="danger")])
+            buttons.append([create_button(f"Remove {name}", callback_data=f"adm:delconf:{uid}", style="danger", icon_custom_emoji_id="5422557736330106570")])
 
-    buttons.append([create_button("➕ Add New Admin", callback_data="adm:add:start", style="success")])
+    buttons.append([create_button("Add New Admin", callback_data="adm:add:start", style="success", icon_custom_emoji_id="5287354223141342798")])
     return text, InlineKeyboardMarkup(buttons)
 
 
 def build_user_manager_view():
     text = "👥 **USER MANAGER**\n\nManage users, search for specific user details, view global statistics, or export the entire database."
     buttons = [
-        [create_button("🔍 Search User", callback_data="adm:usr:search", style="primary")],
-        [create_button("📊 Statistics", callback_data="adm:usr:stats", style="primary")],
-        [create_button("📤 Export Users (JSON)", callback_data="adm:usr:export", style="success")],
-        [create_button("Back to Panel", callback_data="adm:panel_back", style="danger")]
+        [create_button("Search User", callback_data="adm:usr:search", style="primary", icon_custom_emoji_id="6307589808424228455")],
+        [create_button("Statistics", callback_data="adm:usr:stats", style="primary", icon_custom_emoji_id="5352877703043258544")],
+        [create_button("Export Users (JSON)", callback_data="adm:usr:export", style="success", icon_custom_emoji_id="6039573425268201570")],
+        [create_button("Back to Panel", callback_data="adm:panel_back", style="danger", icon_custom_emoji_id="5456187398977247949")]
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -2337,9 +2842,15 @@ def build_user_manager_view():
 def build_stats_view():
     stats = get_global_stats_sync()
     if not stats:
-        return "❌ Failed to load statistics.", InlineKeyboardMarkup([[create_button("Back", callback_data="adm:usr:manager", style="danger")]])
+        return "❌ Failed to load statistics.", InlineKeyboardMarkup([[create_button("Back", callback_data="adm:usr:manager", style="danger", icon_custom_emoji_id="5456187398977247949")]])
 
     text = (
+        "📊 **GLOBAL BOT STATISTICS**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 **Total Users:** `{stats['total_users']}`\n"
+        f"💰 **Total Current Balance:** `{fmt_num(stats['total_balance'])} ৳`\n"
+        f"📈 **Lifetime Earned:** `{fmt_num(stats['total_earned'])} ৳`\n"
+        f"📅 **Today's Earned:** `{fmt_num(stats['today_today'])} ৳`\n" if False else
         "📊 **GLOBAL BOT STATISTICS**\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"👥 **Total Users:** `{stats['total_users']}`\n"
@@ -2355,8 +2866,8 @@ def build_stats_view():
     )
 
     buttons = [
-        [create_button("🔄 Refresh Stats", callback_data="adm:usr:stats", style="success")],
-        [create_button("Back to User Manager", callback_data="adm:usr:manager", style="danger")]
+        [create_button("Refresh Stats", callback_data="adm:usr:stats", style="success", icon_custom_emoji_id="5244758760429213978")],
+        [create_button("Back to User Manager", callback_data="adm:usr:manager", style="danger", icon_custom_emoji_id="5456187398977247949")]
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -2364,21 +2875,21 @@ def build_stats_view():
 def build_admin_services_view():
     summary = get_admin_services_summary()
     if not summary:
-        text = "📱 **SERVICES MANAGEMENT**\n\nNo services added yet."
-        buttons = [[create_button("➕ Add New Service", callback_data="adm:srv:add", style="success")]]
+        text = "📱 <b>SERVICES MANAGEMENT</b>\n\nNo services added yet."
+        buttons = [[create_button("Add New Service", callback_data="adm:srv:add", style="success", icon_custom_emoji_id="5287354223141342798")]]
         return text, InlineKeyboardMarkup(buttons)
 
-    text = "📱 **SERVICES MANAGEMENT**\n\nSummary:"
+    text = "📱 <b>SERVICES MANAGEMENT</b>\n\nSummary:"
     buttons = []
     for srv, cnts in summary.items():
         total_avail = sum(cnts.values())
-        text += f"\n🔹 **{escape_md(srv)}** (Total Available: `{total_avail}`)"
+        text += f"\n🔹 <b>{safe_html_escape(srv)}</b> (Total Available: <code>{total_avail}</code>)"
         for cnt, count in cnts.items():
             payout = get_payout_sync(srv, cnt)
-            text += f"\n   └ {escape_md(cnt)}: `{count}` avail | payout `{fmt_num(payout)}৳`"
-        buttons.append([create_button(f"⚙️ {srv}", callback_data=f"adm:srv:view:{srv}", style="primary")])
+            text += f"\n   └ {safe_html_escape(cnt)}: <code>{count}</code> avail | payout <code>{fmt_num(payout)}৳</code>"
+        buttons.append([create_button(srv, callback_data=f"adm:srv:view:{_cb_clean(srv)}", style="primary", icon_custom_emoji_id="5258096772776991776")])
 
-    buttons.append([create_button("➕ Add New Service / Numbers", callback_data="adm:srv:add", style="success")])
+    buttons.append([create_button("Add New Service / Numbers", callback_data="adm:srv:add", style="success", icon_custom_emoji_id="5287354223141342798")])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -2387,46 +2898,45 @@ def build_service_manage_view(service: str):
     cnts = summary.get(service, {})
     total_avail = sum(cnts.values())
 
-    text = f"⚙️ **SERVICE DETAILS: {escape_md(service)}**\n\n"
-    text += f"📊 Total Available Numbers: `{total_avail}`\n\n"
-    text += "🏳️ **Countries, Quantities & Payouts:**\n"
+    text = f"⚙️ <b>SERVICE DETAILS: {safe_html_escape(service)}</b>\n\n"
+    text += f"📊 Total Available Numbers: <code>{total_avail}</code>\n\n"
+    text += "🏳️ <b>Countries, Quantities &amp; Payouts:</b>\n"
     if cnts:
         for cnt, count in cnts.items():
             payout = get_payout_sync(service, cnt)
             short = get_country_short_sync(service, cnt)
-            # 🆕 Show short name next to full name
-            text += f"• **{escape_md(cnt)}** (`{escape_md(short)}`): `{count}` avail | `{fmt_num(payout)} ৳`\n"
+            text += f"• <b>{safe_html_escape(cnt)}</b> ({safe_html_escape(short)}): <code>{count}</code> avail | <code>{fmt_num(payout)} ৳</code>\n"
     else:
         text += "No countries configured.\n"
 
     buttons = [
-        [create_button("➕ Add Country / Numbers", callback_data=f"adm:srv:add:{service}", style="success")],
+        [create_button("Add Country / Numbers", callback_data=f"adm:srv:add:{_cb_clean(service)}", style="success", icon_custom_emoji_id="5287354223141342798")],
     ]
     if cnts:
-        buttons.append([create_button("💰 Manage Payouts", callback_data=f"adm:pay:mng:{service}", style="primary")])
-    buttons.append([create_button("🗑️ Delete Service", callback_data=f"adm:srv:del:{service}", style="danger")])
+        buttons.append([create_button("Manage Payouts", callback_data=f"adm:pay:mng:{_cb_clean(service)}", style="primary", icon_custom_emoji_id="5417924076503062111")])
+    buttons.append([create_button("Delete Service", callback_data=f"adm:srv:del:{_cb_clean(service)}", style="danger", icon_custom_emoji_id="5422557736330106570")])
     if cnts:
-        buttons.append([create_button("❌ Delete Country", callback_data=f"adm:cnt:delli:{service}", style="danger")])
-    buttons.append([create_button("Back to Services", callback_data="adm:srv:list", style="danger")])
+        buttons.append([create_button("Delete Country", callback_data=f"adm:cnt:delli:{_cb_clean(service)}", style="danger", icon_custom_emoji_id="5422557736330106570")])
+    buttons.append([create_button("Back to Services", callback_data="adm:srv:list", style="danger", icon_custom_emoji_id="5456187398977247949")])
 
     return text, InlineKeyboardMarkup(buttons)
 
 
 def build_payout_manage_view(service: str):
     cnts = get_admin_services_summary().get(service, {})
-    text = f"💰 **PAYOUT MANAGEMENT: {escape_md(service)}**\n\n"
+    text = f"💰 <b>PAYOUT MANAGEMENT: {safe_html_escape(service)}</b>\n\n"
     if cnts:
         for cnt in cnts.keys():
             payout = get_payout_sync(service, cnt)
-            text += f"• **{escape_md(cnt)}**: `{fmt_num(payout)} ৳`\n"
+            text += f"• <b>{safe_html_escape(cnt)}</b>: <code>{fmt_num(payout)} ৳</code>\n"
         text += "\n👉 Tap a country below to edit its payout amount."
     else:
         text += "No countries configured yet."
 
     buttons = []
     for cnt in cnts.keys():
-        buttons.append([create_button(f"✏️ {cnt}", callback_data=f"adm:pay:edit:{service}:{cnt}", style="primary")])
-    buttons.append([create_button("Back", callback_data=f"adm:srv:view:{service}", style="danger")])
+        buttons.append([create_button(cnt, callback_data=f"adm:pay:edit:{_cb_clean(service)}:{_cb_clean(cnt)}", style="primary", icon_custom_emoji_id="5370604433233177619")])
+    buttons.append([create_button("Back", callback_data=f"adm:srv:view:{_cb_clean(service)}", style="danger", icon_custom_emoji_id="5456187398977247949")])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -2449,25 +2959,24 @@ def build_edit_links_view():
         f"Click below to modify settings:"
     )
     buttons = [
-        [create_button("📢 Edit Channel", callback_data="adm:set:channel", style="primary"),
-         create_button("🎧 Edit Support", callback_data="adm:set:support", style="primary")],
-        [create_button("🔗 Edit Group Link", callback_data="adm:set:otplink", style="primary"),
-         create_button("🆔 Edit Forward Group ID", callback_data="adm:set:otpgroupid", style="primary")],
-        [create_button("👨‍💻 Edit Dev Name", callback_data="adm:set:devname", style="primary"),
-         create_button("🔗 Edit Dev Link", callback_data="adm:set:devlink", style="primary")]
+        [create_button("Edit Channel", callback_data="adm:set:channel", style="primary", icon_custom_emoji_id="5370604433233177619"),
+         create_button("Edit Support", callback_data="adm:set:support", style="primary", icon_custom_emoji_id="5370604433233177619")],
+        [create_button("Edit Group Link", callback_data="adm:set:otplink", style="primary", icon_custom_emoji_id="5370604433233177619"),
+         create_button("Edit Forward Group ID", callback_data="adm:set:otpgroupid", style="primary", icon_custom_emoji_id="5370604433233177619")],
+        [create_button("Edit Dev Name", callback_data="adm:set:devname", style="primary", icon_custom_emoji_id="5370604433233177619"),
+         create_button("Edit Dev Link", callback_data="adm:set:devlink", style="primary", icon_custom_emoji_id="5370604433233177619")]
     ]
     return text, InlineKeyboardMarkup(buttons)
-
 
 def build_api_panels_view():
     panels = get_all_api_panels_sync()
     if not panels:
         text = "🌐 **API PANELS MANAGEMENT**\n\nNo API panels connected yet."
         buttons = [
-            [create_button("➕ Connect Standard Panel", callback_data="adm:api:add", style="success")],
-            [create_button("🔧 Connect Custom API", callback_data="adm:api:add_custom", style="primary")],
-            [create_button("🔐 Connect Captcha Panel", callback_data="adm:api:add_captcha", style="danger")],
-            [create_button("Augestel panel", callback_data="adm:api:add_augestel", style="primary")],
+            [create_button("Connect Standard Panel", callback_data="adm:api:add", style="success", icon_custom_emoji_id="5287354223141342798")],
+            [create_button("Connect Custom API", callback_data="adm:api:add_custom", style="primary", icon_custom_emoji_id="5258096772776991776")],
+            [create_button("Connect Captcha Panel", callback_data="adm:api:add_captcha", style="danger", icon_custom_emoji_id="5258508428212445001")],
+            [create_button("Connect Augestel Panel", callback_data="adm:api:add_augestel", style="success", icon_custom_emoji_id="5287354223141342798")],
         ]
         return text, InlineKeyboardMarkup(buttons)
 
@@ -2478,59 +2987,46 @@ def build_api_panels_view():
         pname = p["name"]
         pinterval = p.get("polling_interval", 5.0)
         p_type = get_panel_type(p)
+        tag = " 📡" if p_type == "augestel" else (" 🔐" if p_type == "captcha" else (" 🔧" if p_type == "custom" else ""))
+        text += f"\n🔹 **{escape_md(pname)}**{tag} (Polling: `{pinterval}s`)"
+        if p_type == "captcha":
+            st = CAPTCHA_PANEL_STATUS.get(str(pid), "⏳ Pending login")
+            text += f"\n   └ `{escape_md(st)}`"
         if p_type == "augestel":
-            st = AUGESTEL_PANEL_STATUS.get(str(pid), "🟢 Webhook Ready")
-            ep = _get_augestel_endpoint_url(str(pid))
-            text += (
-                f"\n🔹 **{escape_md(pname)}** 🪝 (Mode: `Webhook`)"
-                f"\n   ├ Endpoint: `{ep}`"
-                f"\n   └ `{escape_md(st)}`"
-            )
-        else:
-            tag = " 🔐" if p_type == "captcha" else (" 🔧" if p_type == "custom" else "")
-            text += f"\n🔹 **{escape_md(pname)}**{tag} (Polling: `{pinterval}s`)"
-            if p_type == "captcha":
-                st = CAPTCHA_PANEL_STATUS.get(str(pid), "⏳ Pending login")
-                text += f"\n   └ `{escape_md(st)}`"
-        buttons.append([create_button(f"⚙️ {pname}", callback_data=f"adm:api:view:{pid}", style="primary")])
+            st = AUGESTEL_PANEL_STATUS.get(str(pid), "⏳ Pending login")
+            text += f"\n   └ `{escape_md(st)}`"
+        buttons.append([create_button(pname, callback_data=f"adm:api:view:{pid}", style="primary", icon_custom_emoji_id="5258096772776991776")])
 
-    buttons.append([create_button("➕ Connect Standard Panel", callback_data="adm:api:add", style="success")])
-    buttons.append([create_button("🔧 Connect Custom API", callback_data="adm:api:add_custom", style="primary")])
-    buttons.append([create_button("🔐 Connect Captcha Panel", callback_data="adm:api:add_captcha", style="danger")])
-    buttons.append([create_button("Augestel panel", callback_data="adm:api:add_augestel", style="primary")])
+    buttons.append([create_button("Connect Standard Panel", callback_data="adm:api:add", style="success", icon_custom_emoji_id="5287354223141342798")])
+    buttons.append([create_button("Connect Custom API", callback_data="adm:api:add_custom", style="primary", icon_custom_emoji_id="5258096772776991776")])
+    buttons.append([create_button("Connect Captcha Panel", callback_data="adm:api:add_captcha", style="danger", icon_custom_emoji_id="5258508428212445001")])
+    buttons.append([create_button("Connect Augestel Panel", callback_data="adm:api:add_augestel", style="success", icon_custom_emoji_id="5287354223141342798")])
     return text, InlineKeyboardMarkup(buttons)
-
 
 def build_panel_manage_view(panel_id: str):
     p = get_api_panel_sync(panel_id)
     if not p:
-        return "⚠️ Panel not found.", InlineKeyboardMarkup([[create_button("Back to Panels", callback_data="adm:api:list", style="danger")]])
+        return "⚠️ Panel not found.", InlineKeyboardMarkup([[create_button("Back to Panels", callback_data="adm:api:list", style="danger", icon_custom_emoji_id="5456187398977247949")]])
 
     if get_panel_type(p) == "augestel":
-        secret = _get_augestel_secret(p)
-        masked_secret = mask_api_key(secret).replace("`", "")
-        exact_endpoint = _get_augestel_endpoint_url(str(panel_id))
-        exact_path = f"/webhook/augestel/{panel_id}"
-        status = AUGESTEL_PANEL_STATUS.get(str(panel_id), "🟢 Listening for webhooks").replace("`", "")
-        rx_count = AUGESTEL_PANEL_COUNTS.get(str(panel_id), 0)
+        try:
+            cfg = json.loads(p.get("mapping_json") or "{}")
+        except Exception:
+            cfg = {}
+        status = AUGESTEL_PANEL_STATUS.get(str(panel_id), "Pending")
         text = (
-            f"🪝 **AUGESTEL PANEL: {escape_md(p['name'])}**\n\n"
-            f"📌 **Panel Name:** {escape_md(p['name'])}\n"
-            f"🧩 **Type:** Webhook (No Polling)\n"
-            f"🎯 **Augestel Dashboard Endpoint:**\n`{exact_endpoint}`\n"
-            f"🛣️ **Method & Route:** `POST {exact_path}`\n"
-            f"📡 **Dashboard Event:** `message.received`\n"
-            f"🔐 **Signature Header:** `X-Augestel-Signature`\n"
-            f"🔑 **Signing Secret:** `{masked_secret}`\n"
-            f"📨 **Received Count:** `{rx_count}`\n"
-            f"📊 **Status:** `{status}`\n"
+            f"📡 **AUGESTEL PANEL: {escape_md(p['name'])}**\n\n"
+            f"🌐 **Login URL:** `{escape_md(cfg.get('login_url', 'N/A'))}`\n"
+            f"👤 **Email:** `{escape_md(cfg.get('email', 'N/A'))}`\n"
+            f"🔑 **Password:** `******`\n"
+            f"⏱️ **Polling Time:** `{p['polling_interval']}s`\n"
+            f"📊 **Status:** `{escape_md(status)}`\n"
         )
         buttons = [
-            [create_button("📋 Copy Dashboard Endpoint", copy_text=exact_endpoint, style="success")],
-            [create_button("🌐 Set Domain / Base URL", callback_data=f"adm:api:aug_domain:{panel_id}", style="primary")],
-            [create_button("🧪 Test Webhook", callback_data=f"adm:api:test:{panel_id}", style="primary")],
-            [create_button("🗑️ Delete Panel", callback_data=f"adm:api:delconf:{panel_id}", style="danger")],
-            [create_button("Back to Panels", callback_data="adm:api:list", style="primary")]
+            [create_button("Test Connection", callback_data=f"adm:api:test:{panel_id}", style="primary", icon_custom_emoji_id="5258508428212445001")],
+            [create_button("Force Re-Login", callback_data=f"adm:api:relogin:{panel_id}", style="success", icon_custom_emoji_id="5244758760429213978")],
+            [create_button("Delete Panel", callback_data=f"adm:api:delconf:{panel_id}", style="danger", icon_custom_emoji_id="5422557736330106570")],
+            [create_button("Back to Panels", callback_data="adm:api:list", style="primary", icon_custom_emoji_id="5456187398977247949")]
         ]
         return text, InlineKeyboardMarkup(buttons)
 
@@ -2554,10 +3050,10 @@ def build_panel_manage_view(panel_id: str):
             f"📊 **Status:** `{escape_md(status)}`\n"
         )
         buttons = [
-            [create_button("🧪 Test Connection", callback_data=f"adm:api:test:{panel_id}", style="primary")],
-            [create_button("🔄 Force Re-Login", callback_data=f"adm:api:relogin:{panel_id}", style="success")],
-            [create_button("🗑️ Delete Panel", callback_data=f"adm:api:delconf:{panel_id}", style="danger")],
-            [create_button("Back to Panels", callback_data="adm:api:list", style="primary")]
+            [create_button("Test Connection", callback_data=f"adm:api:test:{panel_id}", style="primary", icon_custom_emoji_id="5258508428212445001")],
+            [create_button("Force Re-Login", callback_data=f"adm:api:relogin:{panel_id}", style="success", icon_custom_emoji_id="5244758760429213978")],
+            [create_button("Delete Panel", callback_data=f"adm:api:delconf:{panel_id}", style="danger", icon_custom_emoji_id="5422557736330106570")],
+            [create_button("Back to Panels", callback_data="adm:api:list", style="primary", icon_custom_emoji_id="5456187398977247949")]
         ]
         return text, InlineKeyboardMarkup(buttons)
 
@@ -2594,9 +3090,9 @@ def build_panel_manage_view(panel_id: str):
             pass
 
     buttons = [
-        [create_button("🧪 Test Fetch (Debug)", callback_data=f"adm:api:test:{panel_id}", style="primary")],
-        [create_button("🗑️ Delete Panel", callback_data=f"adm:api:delconf:{panel_id}", style="danger")],
-        [create_button("Back to Panels", callback_data="adm:api:list", style="primary")]
+        [create_button("Test Fetch (Debug)", callback_data=f"adm:api:test:{panel_id}", style="primary", icon_custom_emoji_id="5258508428212445001")],
+        [create_button("Delete Panel", callback_data=f"adm:api:delconf:{panel_id}", style="danger", icon_custom_emoji_id="5422557736330106570")],
+        [create_button("Back to Panels", callback_data="adm:api:list", style="primary", icon_custom_emoji_id="5456187398977247949")]
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -2605,12 +3101,12 @@ def build_number_quantity_view():
     current_qty = get_setting("number_quantity", "2")
     text = f"🔢 **NUMBER QUANTITY SETTINGS**\n\nSelect how many numbers a user receives per request.\nCurrent setting: `{current_qty}`"
     buttons = [
-        [create_button("1", callback_data="adm:setqty:1", style="primary" if current_qty != "1" else "success"),
-         create_button("2", callback_data="adm:setqty:2", style="primary" if current_qty != "2" else "success"),
-         create_button("3", callback_data="adm:setqty:3", style="primary" if current_qty != "3" else "success")],
-        [create_button("4", callback_data="adm:setqty:4", style="primary" if current_qty != "4" else "success"),
-         create_button("5", callback_data="adm:setqty:5", style="primary" if current_qty != "5" else "success"),
-         create_button("6", callback_data="adm:setqty:6", style="primary" if current_qty != "6" else "success")]
+        [create_button("1", callback_data="adm:setqty:1", style="primary" if current_qty != "1" else "success", icon_custom_emoji_id="5352877703043258544"),
+         create_button("2", callback_data="adm:setqty:2", style="primary" if current_qty != "2" else "success", icon_custom_emoji_id="5352877703043258544"),
+         create_button("3", callback_data="adm:setqty:3", style="primary" if current_qty != "3" else "success", icon_custom_emoji_id="5352877703043258544")],
+        [create_button("4", callback_data="adm:setqty:4", style="primary" if current_qty != "4" else "success", icon_custom_emoji_id="5352877703043258544"),
+         create_button("5", callback_data="adm:setqty:5", style="primary" if current_qty != "5" else "success", icon_custom_emoji_id="5352877703043258544"),
+         create_button("6", callback_data="adm:setqty:6", style="primary" if current_qty != "6" else "success", icon_custom_emoji_id="5352877703043258544")]
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -2637,14 +3133,12 @@ def build_force_join_view():
     text += "\n⚠️ **Note:** Bot must be an admin in these channels/groups."
 
     buttons = [
-        [create_button(f"Toggle: {status}", callback_data="adm:fj_toggle",
-                       style="success" if enabled else "danger")],
-        [create_button("➕ Add Channel/Group", callback_data="adm:fj_add", style="success")],
+        [create_button(f"Toggle: {status}", callback_data="adm:fj_toggle", style="success" if enabled else "danger", icon_custom_emoji_id="5258096772776991776")],
+        [create_button("Add Channel/Group", callback_data="adm:fj_add", style="success", icon_custom_emoji_id="5287354223141342798")],
     ]
     if chats:
-        buttons.append([create_button("❌ Remove Channel/Group",
-                                      callback_data="adm:fj_rem_list", style="danger")])
-    buttons.append([create_button("Back", callback_data="adm:extra_back", style="danger")])
+        buttons.append([create_button("Remove Channel/Group", callback_data="adm:fj_rem_list", style="danger", icon_custom_emoji_id="6267000941547885720")])
+    buttons.append([create_button("Back", callback_data="adm:extra_back", style="danger", icon_custom_emoji_id="5456187398977247949")])
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -2657,6 +3151,8 @@ def build_extra_settings_view():
     force_join_on = is_force_join_enabled()
     refer_on = get_setting("refer_enabled", "true") == "true"
     refer_pct = get_setting("refer_commission_percent", "5")
+    otp_format = get_setting("otp_group_format", "regular")
+    premium_on = (otp_format == "premium")
 
     msg_status = "ENABLED 🟢" if show_msg else "DISABLED 🔴"
     count_status = "ENABLED 🟢" if show_country_count else "DISABLED 🔴"
@@ -2665,6 +3161,7 @@ def build_extra_settings_view():
     ranking_status = "ENABLED 🟢" if ranking_bonus_on else "DISABLED 🔴"
     fj_status = "ENABLED 🟢" if force_join_on else "DISABLED 🔴"
     refer_status = "ENABLED 🟢" if refer_on else "DISABLED 🔴"
+    otp_format_label = "PREMIUM (Table) 🟢" if premium_on else "REGULAR 🔴"
 
     text = (
         "⚙️ **EXTRA SETTINGS**\n\n"
@@ -2674,22 +3171,97 @@ def build_extra_settings_view():
         f"💸 **Withdraw System:** `{withdraw_status}`\n"
         f"🏆 **Ranking Bonus System:** `{ranking_status}`\n"
         f"🚪 **Force Join System:** `{fj_status}`\n"
-        f"🎁 **Refer System:** `{refer_status}` (Commission: `{refer_pct}%`)\n\n"
+        f"🎁 **Refer System:** `{refer_status}` (Commission: `{refer_pct}%`)\n"
+        f"📨 **OTP Group Format:** `{otp_format_label}`\n\n"
         "Use the buttons below to enable/disable or configure options."
     )
     buttons = [
-        [create_button(f"Show Message: {msg_status}", callback_data="adm:toggle:show_msg", style="success" if show_msg else "danger")],
-        [create_button(f"Country Count: {count_status}", callback_data="adm:toggle:country_count", style="success" if show_country_count else "danger")],
-        [create_button(f"Show Developer: {dev_status}", callback_data="adm:toggle:show_dev", style="success" if show_dev else "danger")],
-        [create_button(f"Withdraw System: {withdraw_status}", callback_data="adm:toggle:withdraw", style="success" if withdraw_on else "danger")],
-        [create_button(f"Ranking Bonus: {ranking_status}", callback_data="adm:toggle:ranking_bonus", style="success" if ranking_bonus_on else "danger")],
-        [create_button("🚪 Force Join Settings", callback_data="adm:fj_settings", style="primary")],
-        [create_button(f"🎁 Refer System: {refer_status}", callback_data="adm:toggle:refer", style="success" if refer_on else "danger")],
-        [create_button(f"✏️ Refer Commission: {refer_pct}%", callback_data="adm:refer_set_pct", style="primary")],
-        [create_button("💳 Withdraw Settings", callback_data="adm:w_settings", style="primary"),
-         create_button("🏆 Ranking Bonuses", callback_data="adm:r_bonus_settings", style="primary")]
+        [create_button(f"Show Message: {msg_status}", callback_data="adm:toggle:show_msg", style="success" if show_msg else "danger", icon_custom_emoji_id="5258096772776991776")],
+        [create_button(f"Country Count: {count_status}", callback_data="adm:toggle:country_count", style="success" if show_country_count else "danger", icon_custom_emoji_id="5258096772776991776")],
+        [create_button(f"Show Developer: {dev_status}", callback_data="adm:toggle:show_dev", style="success" if show_dev else "danger", icon_custom_emoji_id="5258096772776991776")],
+        [create_button(f"Withdraw System: {withdraw_status}", callback_data="adm:toggle:withdraw", style="success" if withdraw_on else "danger", icon_custom_emoji_id="5258096772776991776")],
+        [create_button(f"Ranking Bonus: {ranking_status}", callback_data="adm:toggle:ranking_bonus", style="success" if ranking_bonus_on else "danger", icon_custom_emoji_id="5258096772776991776")],
+        [create_button("Force Join Settings", callback_data="adm:fj_settings", style="primary", icon_custom_emoji_id="5258096772776991776")],
+        [create_button(f"Refer System: {refer_status}", callback_data="adm:toggle:refer", style="success" if refer_on else "danger", icon_custom_emoji_id="5258096772776991776")],
+        [create_button(f"Refer Commission: {refer_pct}%", callback_data="adm:refer_set_pct", style="primary", icon_custom_emoji_id="5258096772776991776")],
+        [create_button(f"OTP Group Format: {otp_format_label}", callback_data="adm:toggle:otp_format", style="success" if premium_on else "danger", icon_custom_emoji_id="5258096772776991776")],
+        [create_button("Withdraw Settings", callback_data="adm:w_settings", style="primary", icon_custom_emoji_id="5258096772776991776"),
+         create_button("Ranking Bonuses", callback_data="adm:r_bonus_settings", style="primary", icon_custom_emoji_id="5258096772776991776")],
+        [create_button("CLI Emojis", callback_data="adm:cliemoji:list", style="primary", icon_custom_emoji_id="5258096772776991776")]
     ]
     return text, InlineKeyboardMarkup(buttons)
+
+
+def build_cli_emojis_view():
+    keys = [k for k in SETTINGS_CACHE.keys() if k.startswith("cli_emoji:")]
+    text = "🔠 **CLI EMOJI MANAGEMENT**\n\n"
+    if keys:
+        for k in keys:
+            cli = k.split(":", 1)[1]
+            text += f"• **{html.escape(cli)}** → `<tg-emoji emoji-id=\"{SETTINGS_CACHE[k]}\">🎲</tg-emoji>`\n"
+    else:
+        text += "_No CLI emojis configured._\n"
+
+    buttons = [
+        [create_button("Add / Edit CLI Emoji", callback_data="adm:cliemoji:add", style="success")],
+        [create_button("Delete CLI Emoji", callback_data="adm:cliemoji:del_list", style="danger")],
+        [create_button("Back", callback_data="adm:extra_back", style="danger")]
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+@admin_only
+async def admin_cliemoji_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.message.reply_text(
+        "Enter the **CLI Name** (e.g., `1xbet`):",
+        parse_mode="Markdown"
+    )
+    return WAIT_CLI_EMOJI_NAME
+
+
+async def receive_cli_emoji_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text or ""
+    ents = update.message.entities or []
+    processed = entities_to_tg_emoji(raw, ents)
+    clean = strip_all_emojis(processed).lower()
+    if not clean:
+        await update.message.reply_text("❌ Empty CLI name. Try again:")
+        return WAIT_CLI_EMOJI_NAME
+    context.user_data['cli_emoji_name'] = clean
+    await update.message.reply_text(
+        f"CLI: `{escape_md(clean)}`\nNow send the **Premium Emoji** for this CLI:",
+        parse_mode="Markdown"
+    )
+    return WAIT_CLI_EMOJI_VAL
+
+
+async def receive_cli_emoji_val(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cli_name = context.user_data.get('cli_emoji_name')
+    emoji_id = None
+
+    # ১. টেলিগ্রাম এনটিটি থেকে প্রিমিয়াম ইমোজি আইডি খোঁজা
+    if update.message.entities:
+        for entity in update.message.entities:
+            if entity.type == MessageEntity.CUSTOM_EMOJI:
+                emoji_id = entity.custom_emoji_id
+                break
+
+    # ২. যদি ইউজার সরাসরি <tg-emoji> ট্যাগ পেস্ট করে
+    if not emoji_id and update.message.text:
+        match = re.search(r'emoji-id="(\d+)"', update.message.text)
+        if match:
+            emoji_id = match.group(1)
+
+    if emoji_id and cli_name:
+        await run_db(set_setting, f"cli_emoji:{cli_name}", emoji_id)
+        await update.message.reply_text(f"✅ CLI Emoji for **{escape_md(cli_name)}** saved successfully!", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Invalid input. Please send a valid Telegram Premium Emoji.")
+
+    context.user_data.pop('cli_emoji_name', None)
+    text_msg, kbd = build_cli_emojis_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
 
 
 def build_ranking_bonus_settings_view():
@@ -2707,10 +3279,10 @@ def build_ranking_bonus_settings_view():
         f"🥉 **Top 3 Bonus:** `{b3} ৳`\n"
     )
     buttons = [
-        [create_button("✏️ Edit Top 1 Bonus", callback_data="adm:r_set_b1", style="primary")],
-        [create_button("✏️ Edit Top 2 Bonus", callback_data="adm:r_set_b2", style="primary")],
-        [create_button("✏️ Edit Top 3 Bonus", callback_data="adm:r_set_b3", style="primary")],
-        [create_button("Back", callback_data="adm:extra_back", style="danger")]
+        [create_button("Edit Top 1 Bonus", callback_data="adm:r_set_b1", style="primary", icon_custom_emoji_id="5370604433233177619")],
+        [create_button("Edit Top 2 Bonus", callback_data="adm:r_set_b2", style="primary", icon_custom_emoji_id="5370604433233177619")],
+        [create_button("Edit Top 3 Bonus", callback_data="adm:r_set_b3", style="primary", icon_custom_emoji_id="5370604433233177619")],
+        [create_button("Back", callback_data="adm:extra_back", style="danger", icon_custom_emoji_id="5456187398977247949")]
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -2731,10 +3303,10 @@ def build_withdraw_settings_view():
         text += "No active payment methods.\n"
 
     buttons = [
-        [create_button("➕ Add Method", callback_data="adm:w_add_m", style="success"),
-         create_button("❌ Remove Method", callback_data="adm:w_del_m_list", style="danger")],
-        [create_button("✏️ Edit Min Amount", callback_data="adm:w_set_min", style="primary")],
-        [create_button("Back", callback_data="adm:extra_back", style="danger")]
+        [create_button("Add Method", callback_data="adm:w_add_m", style="success", icon_custom_emoji_id="5287354223141342798"),
+         create_button("Remove Method", callback_data="adm:w_del_m_list", style="danger", icon_custom_emoji_id="6267000941547885720")],
+        [create_button("Edit Min Amount", callback_data="adm:w_set_min", style="primary", icon_custom_emoji_id="5370604433233177619")],
+        [create_button("Back", callback_data="adm:extra_back", style="danger", icon_custom_emoji_id="5456187398977247949")]
     ]
     return text, InlineKeyboardMarkup(buttons)
 
@@ -2773,33 +3345,39 @@ def build_admin_withdraw_requests_view(page: int = 1):
 
     buttons = []
     for r in page_reqs:
-        st_icon = "⏳" if r["status"] == "pending" else ("✅" if r["status"] == "approved" else "❌")
+        if r["status"] == "pending":
+            icon_id = None
+        elif r["status"] == "approved":
+            icon_id = "5424998570539373838"
+        else:
+            icon_id = "6267000941547885720"
+
         uname = uname_map.get(r["user_id"]) or r.get("username") or f"User {r['user_id']}"
         uname = uname.lstrip("@")
         if len(uname) > 16:
             uname = uname[:13] + "…"
-        btn_text = f"{st_icon} @{uname} • {fmt_num(r['amount'])}৳"
-        buttons.append([create_button(btn_text, callback_data=f"adm:w_view:{r['id']}", style="primary")])
+        
+        btn_text = f"@{uname} • {fmt_num(r['amount'])}৳"
+        buttons.append([create_button(btn_text, callback_data=f"adm:w_view:{r['id']}", style="primary", icon_custom_emoji_id=icon_id)])
 
     nav_row = []
     if page > 1:
-        nav_row.append(create_button("⬅️ Prev", callback_data=f"adm:w_page:{page-1}", style="primary"))
+        nav_row.append(create_button("Prev", callback_data=f"adm:w_page:{page-1}", style="primary", icon_custom_emoji_id="5456187398977247949"))
     if total_pages > 1:
         nav_row.append(create_button(f"{page}/{total_pages}", callback_data="noop", style="primary"))
     if page < total_pages:
-        nav_row.append(create_button("Next ➡️", callback_data=f"adm:w_page:{page+1}", style="primary"))
+        nav_row.append(create_button("Next", callback_data=f"adm:w_page:{page+1}", style="primary"))
 
     if nav_row:
         buttons.append(nav_row)
 
-    buttons.append([create_button("Back to Panel", callback_data="adm:panel_back", style="danger")])
+    buttons.append([create_button("Back to Panel", callback_data="adm:panel_back", style="danger", icon_custom_emoji_id="5456187398977247949")])
     return text, InlineKeyboardMarkup(buttons)
-
 
 def build_withdraw_detail_view(req_id: int):
     r = get_withdraw_request_by_id_sync(req_id)
     if not r:
-        return "⚠️ Request not found.", InlineKeyboardMarkup([[create_button("Back", callback_data="adm:w_page:1", style="danger")]])
+        return "⚠️ Request not found.", InlineKeyboardMarkup([[create_button("Back", callback_data="adm:w_page:1", style="danger", icon_custom_emoji_id="5456187398977247949")]])
 
     dt_str = datetime.datetime.fromtimestamp(r["created_at"]).strftime("%Y-%m-%d %H:%M:%S") if r["created_at"] else "N/A"
     st_text = r["status"].upper()
@@ -2825,10 +3403,10 @@ def build_withdraw_detail_view(req_id: int):
     buttons = []
     if r["status"] == "pending":
         buttons.append([
-            create_button("✅ APPROVE", callback_data=f"adm:w_app:{r['id']}", style="success"),
-            create_button("❌ REJECT", callback_data=f"adm:w_rej_start:{r['id']}", style="danger")
+            create_button("APPROVE", callback_data=f"adm:w_app:{r['id']}", style="success", icon_custom_emoji_id="5424998570539373838"),
+            create_button("REJECT", callback_data=f"adm:w_rej_start:{r['id']}", style="danger", icon_custom_emoji_id="6267000941547885720")
         ])
-    buttons.append([create_button("Back to Requests", callback_data="adm:w_page:1", style="primary")])
+    buttons.append([create_button("Back to Requests", callback_data="adm:w_page:1", style="primary", icon_custom_emoji_id="5456187398977247949")])
 
     return text, InlineKeyboardMarkup(buttons)
 
@@ -2836,6 +3414,8 @@ def build_withdraw_detail_view(req_id: int):
 def build_allocation_keyboard(service: str, country: str, numbers: list, hide_cc: bool = False):
     otp_group_link = clean_tg_link(get_setting("otp_group_link", "https://t.me/your_otp_group"))
     buttons = []
+    srv_cb = _cb_clean(service)
+    cnt_cb = _cb_clean(country)
 
     cc_len_str = get_setting(f"cc_len:{service}:{country}", "0")
     try:
@@ -2854,17 +3434,22 @@ def build_allocation_keyboard(service: str, country: str, numbers: list, hide_cc
         buttons.append([create_button(f"{num}", copy_text=str(num), style="success")])
 
     if cc_len > 0:
-        toggle_text = "Show CC" if hide_cc else "Hide CC"
-        toggle_data = f"togcc:{service}:{country}:0" if hide_cc else f"togcc:{service}:{country}:1"
-        buttons.append([create_button(toggle_text, callback_data=toggle_data, style="danger")])
+        if hide_cc:
+            toggle_text = "Show CC"
+            toggle_data = f"togcc:{srv_cb}:{cnt_cb}:0"
+            toggle_emoji = "6156854417887859761"
+        else:
+            toggle_text = "Hide CC"
+            toggle_data = f"togcc:{srv_cb}:{cnt_cb}:1"
+            toggle_emoji = "5337166274587799243"
+        buttons.append([create_button(toggle_text, callback_data=toggle_data, style="danger", icon_custom_emoji_id=toggle_emoji)])
 
     buttons.append([
-        create_button("Change All", callback_data=f"chg:{service}:{country}", style="primary"),
-        create_button("OTP Group", url=otp_group_link, style="primary")
+        create_button("Change All", callback_data=f"chg:{srv_cb}:{cnt_cb}", style="primary", icon_custom_emoji_id="5219934485113493317"),
+        create_button("OTP Group", url=otp_group_link, style="primary", icon_custom_emoji_id="5836754611305713785")
     ])
-    buttons.append([create_button("Back", callback_data=f"srv_{service}", style="danger")])
+    buttons.append([create_button("Back", callback_data=f"srv_{srv_cb}", style="danger", icon_custom_emoji_id="5456187398977247949")])
     return InlineKeyboardMarkup(buttons)
-
 
 def get_services_keyboard():
     services = list(SERVICES_CACHE.keys())
@@ -2874,155 +3459,14 @@ def get_services_keyboard():
     buttons = []
     for i in range(0, len(services), 2):
         row = []
-        row.append(create_button(services[i], callback_data=f"srv_{services[i]}", style="primary"))
+        row.append(create_button(services[i], callback_data=f"srv_{_cb_clean(services[i])}", style="primary"))
         if i + 1 < len(services):
-            row.append(create_button(services[i+1], callback_data=f"srv_{services[i+1]}", style="primary"))
+            row.append(create_button(services[i+1], callback_data=f"srv_{_cb_clean(services[i+1])}", style="primary"))
         buttons.append(row)
 
-    return InlineKeyboardMarkup(buttons), "📍 Please select a service:"
-
+    return InlineKeyboardMarkup(buttons), '<tg-emoji emoji-id="5352922460897452503">📍</tg-emoji> Please select a service:'
 
 flask_app = Flask(__name__)
-
-
-@flask_app.before_request
-def _capture_public_base_url():
-    global _DETECTED_BASE_URL
-    if _DETECTED_BASE_URL:
-        return
-    host = (request.headers.get("X-Forwarded-Host") or request.host or "").split(",")[0].strip()
-    if host and not host.startswith(("127.0.0.1", "localhost", "0.0.0.0")):
-        proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "https").split(",")[0].strip()
-        _DETECTED_BASE_URL = f"{proto}://{host}"
-
-
-def _get_augestel_panels_cached(force_refresh: bool = False) -> list:
-    now = time.time()
-    if (
-        not force_refresh
-        and _AUGESTEL_PANELS_CACHE["loaded"]
-        and (now - _AUGESTEL_PANELS_CACHE["ts"]) < PANEL_INFO_CACHE_TTL
-    ):
-        return _AUGESTEL_PANELS_CACHE["panels"]
-    all_panels = get_all_api_panels_sync()
-    aug_panels = [p for p in all_panels if get_panel_type(p) == "augestel"]
-    _AUGESTEL_PANELS_CACHE["panels"] = aug_panels
-    _AUGESTEL_PANELS_CACHE["ts"] = now
-    _AUGESTEL_PANELS_CACHE["loaded"] = True
-    return aug_panels
-
-
-async def _process_augestel_webhook_item(panel_id: str, item: dict):
-    try:
-        if _POLLER_READY_EVENT is not None:
-            await asyncio.wait_for(_POLLER_READY_EVENT.wait(), timeout=15.0)
-    except Exception:
-        pass
-    if _SHARED_PROCESSED_IDS is None or _BOT_APP is None:
-        return
-    new_items, new_ids = _filter_new_items([item], _SHARED_PROCESSED_IDS)
-    if not new_items:
-        return
-    logger.info(f"Augestel Panel {panel_id}: {len(new_items)} new items → delivering")
-    try:
-        await run_db(mark_otp_seen_batch_sync, new_ids)
-    except Exception as e:
-        for mid in new_ids:
-            _SHARED_PROCESSED_IDS.pop(mid, None)
-        logger.error(f"mark_otp_seen failed, rolled back {len(new_ids)}: {e}")
-        return
-    try:
-        await process_otp_items_fast(new_items, _BOT_APP)
-    except Exception as e:
-        logger.exception(f"process_otp_items_fast CRASHED: {e}")
-
-
-@flask_app.route('/webhook/augestel', methods=['POST'])
-@flask_app.route('/webhook/augestel/<panel_id>', methods=['POST'])
-def augestel_webhook(panel_id: Optional[str] = None):
-    raw_body = request.get_data(cache=False)
-    sig_header = (request.headers.get("X-Augestel-Signature") or "").strip()
-    event_header = (request.headers.get("X-Augestel-Event") or "").strip()
-    ts_header = (request.headers.get("X-Augestel-Timestamp") or "").strip()
-
-    if not sig_header:
-        return jsonify({"error": "missing signature"}), 401
-
-    candidates = _get_augestel_panels_cached(force_refresh=False)
-    if panel_id is not None:
-        candidates = [p for p in candidates if str(p.get("id")) == str(panel_id)]
-
-    matched_panel = None
-    for p in candidates:
-        if _verify_augestel_signature(raw_body, _get_augestel_secret(p), sig_header):
-            matched_panel = p
-            break
-
-    if matched_panel is None and (time.time() - _AUGESTEL_PANELS_CACHE["ts"]) > 2.0:
-        candidates = _get_augestel_panels_cached(force_refresh=True)
-        if panel_id is not None:
-            candidates = [p for p in candidates if str(p.get("id")) == str(panel_id)]
-        for p in candidates:
-            if _verify_augestel_signature(raw_body, _get_augestel_secret(p), sig_header):
-                matched_panel = p
-                break
-
-    if matched_panel is None:
-        if not candidates:
-            return jsonify({"error": "augestel panel not found"}), 404
-        return jsonify({"error": "invalid signature"}), 401
-
-    pid = str(matched_panel["id"])
-
-    try:
-        payload = json.loads(raw_body.decode("utf-8"))
-    except Exception:
-        return jsonify({"error": "invalid json"}), 400
-
-    if not isinstance(payload, dict):
-        return jsonify({"error": "invalid payload"}), 400
-
-    event_name = event_header or str(payload.get("event") or "").strip()
-    if event_name != "message.received":
-        AUGESTEL_PANEL_STATUS[pid] = f"✅ Verified ({event_name or 'event'})"
-        return jsonify({"status": "ok"}), 200
-
-    data = payload.get("data")
-    if not isinstance(data, dict):
-        return jsonify({"error": "invalid data"}), 400
-
-    raw_number = str(data.get("number") or "").strip()
-    clean_num = re.sub(r'\D', '', raw_number)
-    msg_text = str(data.get("message") or "")
-    if not clean_num or not msg_text:
-        return jsonify({"status": "ok"}), 200
-
-    dt_val = (
-        data.get("received_at")
-        or data.get("received\\_at")
-        or payload.get("timestamp")
-        or ts_header
-        or ""
-    )
-    source_val = str(data.get("source") or "").strip()
-
-    item = {
-        "num": clean_num,
-        "message": msg_text,
-        "dt": str(dt_val),
-        "payout": 1,
-        "cli": source_val,
-    }
-
-    if _MAIN_LOOP is None or _BOT_APP is None or not _MAIN_LOOP.is_running():
-        return jsonify({"error": "bot starting"}), 503
-
-    AUGESTEL_PANEL_COUNTS[pid] = AUGESTEL_PANEL_COUNTS.get(pid, 0) + 1
-    tail = clean_num[-4:] if len(clean_num) >= 4 else clean_num
-    AUGESTEL_PANEL_STATUS[pid] = f"✅ Received: {AUGESTEL_PANEL_COUNTS[pid]} | Last: ..{tail}"
-
-    asyncio.run_coroutine_threadsafe(_process_augestel_webhook_item(pid, item), _MAIN_LOOP)
-    return jsonify({"status": "ok"}), 200
 
 
 @flask_app.route('/')
@@ -3039,6 +3483,7 @@ def health():
         "services": len(SERVICES_CACHE),
         "panels": len(PANEL_TASKS),
         "captcha_sessions": len(CAPTCHA_SESSIONS),
+        "augestel_sessions": len(AUGESTEL_SESSIONS),
         "batch_rpc": "enabled" if _BATCH_RPC_AVAILABLE else "fallback",
         "firebase": "connected" if firebase_db_ref else "disabled",
         "otp_retention_days": OTP_ID_RETENTION_SECONDS // 86400,
@@ -3046,6 +3491,15 @@ def health():
         "chat_locks": len(_CHAT_LOCKS),
         "force_join_enabled": is_force_join_enabled(),
         "refer_enabled": get_setting("refer_enabled", "true") == "true",
+        "otp_group_format": get_setting("otp_group_format", "regular"),
+        "anti_abuse": {
+            "cooldown_seconds": NUMBER_CLAIM_COOLDOWN,
+            "change_window_seconds": NUMBER_CHANGE_WINDOW,
+            "ban_threshold": NUMBER_CHANGE_BAN_THRESHOLD,
+            "active_cooldowns": len(_LAST_NUMBER_CLAIM),
+            "tracked_changes": len(_RECENT_NUMBER_CHANGES),
+            "in_memory_bans": len(_IN_MEMORY_BANNED),
+        },
     })
 
 
@@ -3065,66 +3519,55 @@ def run_flask():
     WAIT_MAP_STATUS_PATH, WAIT_MAP_STATUS_VALUE, WAIT_MAP_DATA_PATH,
     WAIT_MAP_NUM_PATH, WAIT_MAP_MSG_PATH, WAIT_MAP_DT_PATH,
     WAIT_MAP_PAYOUT_PATH, WAIT_MAP_CLI_PATH,
-    # 🔐 Captcha Panel States
     WAIT_CPT_LOGIN_URL, WAIT_CPT_USERNAME, WAIT_CPT_PASSWORD,
     WAIT_CPT_MSG_LINK, WAIT_CPT_NUM_COL_NAME, WAIT_CPT_NUM_COL_IDX,
     WAIT_CPT_MSG_COL_NAME, WAIT_CPT_MSG_COL_IDX,
     WAIT_CPT_DT_COL_NAME, WAIT_CPT_DT_COL_IDX,
-    # 🆕 Force Join + Refer States
     WAIT_FJ_CHAT_ID, WAIT_FJ_CHAT_TITLE, WAIT_FJ_CHAT_LINK, WAIT_FJ_CHAT_TYPE,
     WAIT_REFER_PERCENT,
     WAIT_CC_LENGTH,
     WAIT_USER_SEARCH,
-    WAIT_COUNTRY_SHORT,   # 🆕 Country short form state
-    WAIT_AUGESTEL_SECRET,
-    WAIT_AUGESTEL_DOMAIN,
-) = range(53)
+    WAIT_COUNTRY_SHORT,
+    WAIT_CLI_EMOJI_NAME, WAIT_CLI_EMOJI_VAL,
+    WAIT_AUG_EMAIL, WAIT_AUG_PASSWORD, WAIT_AUG_API_KEY,
+) = range(55)
 
-
-def admin_only(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        query = update.callback_query
-        user = update.effective_user
-        if query:
-            try:
-                await query.answer()
-            except Exception:
-                pass
-        if not user or not (await run_db(is_admin_sync, user.id)):
-            return ConversationHandler.END
-        return await func(update, context, *args, **kwargs)
-    return wrapper
+AUGESTEL_PROCESSED_OTPS = TimedLRUDict(maxsize=100000, ttl=86400)
 
 
 def get_main_keyboard(user_id: int):
-    keyboard_layout = [
-        [{"text": "GET NUMBER", "style": "success"}],
-        [{"text": "PROFILE", "style": "primary"}, {"text": "WALLET", "style": "primary"}],
-        [{"text": "RANKING", "style": "danger"}, {"text": "SUPPORT", "style": "danger"}]
+    buttons = [
+        [KeyboardButton("Get Number", icon_custom_emoji_id="6204108584381322968", style="success")],
+        [
+            KeyboardButton("Profile", icon_custom_emoji_id="6307589808424228455", style="primary"),
+            KeyboardButton("Wallet", icon_custom_emoji_id="6206155797722830770", style="primary")
+        ],
+        [
+            KeyboardButton("Ranking", icon_custom_emoji_id="6206343625232619150", style="danger"),
+            KeyboardButton("Support", icon_custom_emoji_id="5348323259593014362", style="danger")
+        ]
     ]
     if is_admin_sync(user_id):
-        keyboard_layout.append([{"text": "ADMIN PANEL", "style": "danger"}])
-    return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
+        buttons.append([KeyboardButton("Admin Panel", icon_custom_emoji_id="5258508428212445001", style="danger")])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
 def get_admin_keyboard():
-    keyboard_layout = [
-        [{"text": "SERVICES", "style": "success"}, {"text": "BROADCAST", "style": "success"}],
-        [{"text": "ADMIN CONTROL", "style": "primary"}, {"text": "GLOBAL SETTINGS", "style": "primary"}],
-        [{"text": "USER MANAGER", "style": "primary"}, {"text": "MANAGE PAYOUTS", "style": "primary"}],
-        [{"text": "BACK", "style": "danger"}]
+    buttons = [
+        [KeyboardButton("Services", icon_custom_emoji_id="5258096772776991776", style="success"), KeyboardButton("Broadcast", icon_custom_emoji_id="5800920921766104807", style="success")],
+        [KeyboardButton("Admin Control", icon_custom_emoji_id="5258508428212445001", style="primary"), KeyboardButton("Global Settings", icon_custom_emoji_id="5258096772776991776", style="primary")],
+        [KeyboardButton("User Manager", icon_custom_emoji_id="6307589808424228455", style="primary"), KeyboardButton("Manage Payouts", icon_custom_emoji_id="5417924076503062111", style="primary")],
+        [KeyboardButton("Back", icon_custom_emoji_id="5456187398977247949", style="danger")]
     ]
-    return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
-
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def get_global_settings_keyboard():
-    keyboard_layout = [
-        [{"text": "EDIT LINKS", "style": "success"}, {"text": "EDIT API", "style": "success"}],
-        [{"text": "NUMBER QUANTITY", "style": "primary"}, {"text": "EXTRA", "style": "primary"}],
-        [{"text": "BACK", "style": "danger"}]
+    buttons = [
+        [KeyboardButton("Edit Links", icon_custom_emoji_id="5370604433233177619", style="success"), KeyboardButton("Edit API", icon_custom_emoji_id="5258096772776991776", style="success")],
+        [KeyboardButton("Number Quantity", icon_custom_emoji_id="5352877703043258544", style="primary"), KeyboardButton("Extra", icon_custom_emoji_id="5258096772776991776", style="primary")],
+        [KeyboardButton("Back", icon_custom_emoji_id="5456187398977247949", style="danger")]
     ]
-    return ReplyKeyboardMarkup(keyboard_layout, resize_keyboard=True)
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3132,6 +3575,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     first_name = update.effective_user.first_name or ""
     username = update.effective_user.username or ""
     await run_db(save_user, user_id, first_name, username)
+
+    if not is_admin_sync(user_id) and await run_db(is_user_banned_sync, user_id):
+        await update.message.reply_text(
+            BANNED_TEXT, reply_markup=_banned_keyboard(), parse_mode="HTML",
+        )
+        return
 
     if context.args:
         try:
@@ -3151,7 +3600,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'map_payout_path', 'map_cli_path', 'new_api_interval',
                 'cpt_login_url', 'cpt_username', 'cpt_password', 'cpt_msg_link',
                 'cpt_num_col_name', 'cpt_num_col_idx', 'cpt_msg_col_name',
-                'fj_chat_id', 'fj_chat_title', 'fj_chat_link', 'cc_length',
+                'fj_chat_id', 'fj_chat_title', 'fj_chat_link', 'cc_length', 'aug_email', 'aug_password',
                 'country_short'):
         context.user_data.pop(key, None)
 
@@ -3185,6 +3634,13 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_upper = text.strip().upper()
     user_is_admin = is_admin_sync(user_id)
 
+    if not user_is_admin and text_upper in ("GET NUMBER",):
+        if await run_db(is_user_banned_sync, user_id):
+            await update.message.reply_text(
+                BANNED_TEXT, reply_markup=_banned_keyboard(), parse_mode="HTML",
+            )
+            return
+
     if not user_is_admin and is_force_join_enabled():
         chats = get_force_join_chats()
         if chats:
@@ -3203,7 +3659,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not kbd:
             await update.message.reply_text(msg)
         else:
-            await update.message.reply_text(msg, reply_markup=kbd)
+            await update.message.reply_text(msg, reply_markup=kbd, parse_mode="HTML")
 
     elif text_upper == "PROFILE":
         first_name_esc = escape_md(first_name or "User")
@@ -3275,7 +3731,7 @@ async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text_upper == "SERVICES" and user_is_admin:
         context.user_data['current_menu'] = 'admin'
         text_msg, kbd = await run_db(build_admin_services_view)
-        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="HTML")
 
     elif text_upper == "USER MANAGER" and user_is_admin:
         context.user_data['current_menu'] = 'admin'
@@ -3334,13 +3790,21 @@ async def user_start_withdraw_flow(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
 
+    user_id = query.from_user.id
+
+    if not is_admin_sync(user_id) and await run_db(is_user_banned_sync, user_id):
+        await query.edit_message_text(
+            "🚫 You are banned and cannot withdraw.\n\nContact support to resolve.",
+            reply_markup=_banned_keyboard(), parse_mode="HTML",
+        )
+        return ConversationHandler.END
+
     withdraw_on = get_setting("withdraw_enabled", "true") == "true"
     if not withdraw_on:
         await query.edit_message_text("❌ Withdraw system is currently disabled by Admin.")
         return ConversationHandler.END
 
     method = query.data.split(":", 2)[2]
-    user_id = query.from_user.id
 
     bal = await run_db(get_user_balance_sync, user_id)
     min_w = float(get_setting("min_withdraw_amount", "50") or 50)
@@ -3459,7 +3923,8 @@ async def start_edit_payout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 5:
         await query.message.reply_text("⚠️ Invalid edit request.")
         return ConversationHandler.END
-    service, country = parts[3], parts[4]
+    service = _resolve_full_key(parts[3], list(SERVICES_CACHE.keys()))
+    country = _resolve_full_key(parts[4], list(SERVICES_CACHE.get(service, {}).keys()))
     context.user_data['pay_edit_service'] = service
     context.user_data['pay_edit_country'] = country
     context.user_data['pay_flow'] = 'edit'
@@ -3467,11 +3932,11 @@ async def start_edit_payout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     curr = get_payout_sync(service, country)
     await query.message.reply_text(
         f"💰 Editing payout for:\n"
-        f"🏷️ Service: **{escape_md(service)}**\n"
-        f"🏳️ Country: **{escape_md(country)}**\n\n"
-        f"Current payout: `{fmt_num(curr)} ৳`\n"
-        f"Send new amount (or send `default` for {fmt_num(DEFAULT_PAYOUT)} ৳):",
-        parse_mode="Markdown"
+        f"🏷️ Service: <b>{safe_html_escape(service)}</b>\n"
+        f"🏳️ Country: <b>{safe_html_escape(country)}</b>\n\n"
+        f"Current payout: <code>{fmt_num(curr)} ৳</code>\n"
+        f"Send new amount (or send <code>default</code> for {fmt_num(DEFAULT_PAYOUT)} ৳):",
+        parse_mode="HTML"
     )
     return WAIT_PAYOUT_AMOUNT
 
@@ -3496,11 +3961,12 @@ async def receive_payout_amount(update: Update, context: ContextTypes.DEFAULT_TY
         country = context.user_data.get('pay_edit_country')
         await run_db(set_payout_sync, service, country, val)
         await update.message.reply_text(
-            f"✅ Payout for **{escape_md(service)}** → **{escape_md(country)}** set to `{fmt_num(val)} ৳`!",
-            parse_mode="Markdown"
+            f"✅ Payout for <b>{safe_html_escape(service)}</b> → "
+            f"<b>{safe_html_escape(country)}</b> set to <code>{fmt_num(val)} ৳</code>!",
+            parse_mode="HTML"
         )
         text_msg, kbd = build_payout_manage_view(service)
-        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="HTML")
         for key in ('pay_flow', 'pay_edit_service', 'pay_edit_country'):
             context.user_data.pop(key, None)
         return ConversationHandler.END
@@ -3536,6 +4002,55 @@ async def receive_cc_length(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ADD_NUMBERS
 
 
+def _build_user_detail_view(uid: int, user_data: dict) -> Tuple[str, InlineKeyboardMarkup]:
+    uname = user_data.get("username") or "No username"
+    fname = user_data.get("first_name") or "No name"
+    balance = fmt_num(user_data.get("balance", 0))
+    today = fmt_num(user_data.get("today_earned", 0))
+    total_e = fmt_num(user_data.get("total_earned", 0))
+    ref_e = fmt_num(user_data.get("refer_earned", 0))
+    total_o = user_data.get("total_otps", 0)
+    weekly_o = user_data.get("weekly_otps", 0)
+    ref_by = user_data.get("referred_by") or "None"
+    last_date = user_data.get("last_earn_date") or "N/A"
+
+    is_banned = bool(user_data.get("is_banned", False)) or (uid in _IN_MEMORY_BANNED)
+    ban_reason = ""
+    if is_banned:
+        ban_reason = _IN_MEMORY_BAN_REASONS.get(uid) or user_data.get("ban_reason") or ""
+
+    status_icon = "🚫 <b>BANNED</b>" if is_banned else "✅ Active"
+
+    text = (
+        f"👤 <b>USER DETAILS</b>\n\n"
+        f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
+        f"👤 <b>First Name:</b> {html.escape(fname)}\n"
+        f"🏷️ <b>Username:</b> @{html.escape(uname)}\n"
+        f"📊 <b>Status:</b> {status_icon}\n"
+        f"💰 <b>Balance:</b> <code>{balance} ৳</code>\n"
+        f"📈 <b>Total Earned:</b> <code>{total_e} ৳</code>\n"
+        f"📅 <b>Today Earned:</b> <code>{today} ৳</code>\n"
+        f"🎁 <b>Refer Earned:</b> <code>{ref_e} ৳</code>\n"
+        f"📨 <b>Total OTPs:</b> <code>{total_o}</code>\n"
+        f"📊 <b>Weekly OTPs:</b> <code>{weekly_o}</code>\n"
+        f"🔗 <b>Referred By:</b> <code>{ref_by}</code>\n"
+        f"📅 <b>Last Earn Date:</b> <code>{last_date}</code>"
+    )
+    if is_banned and ban_reason:
+        text += f"\n\n🚫 <b>Ban Reason:</b>\n<blockquote>{html.escape(ban_reason)}</blockquote>"
+
+    buttons = []
+    if is_banned:
+        buttons.append([create_button("🔓 Unban User", callback_data=f"adm:usr:unban:{uid}", style="success")])
+    else:
+        buttons.append([create_button("🚫 Ban User", callback_data=f"adm:usr:ban:{uid}", style="danger")])
+    buttons.append([create_button("🗑️ Release All Numbers", callback_data=f"adm:usr:release:{uid}", style="danger")])
+    buttons.append([create_button("🔍 Search Another", callback_data="adm:usr:search", style="primary")])
+    buttons.append([create_button("Back to User Manager", callback_data="adm:usr:manager", style="danger")])
+
+    return text, InlineKeyboardMarkup(buttons)
+
+
 @admin_only
 async def admin_search_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text(
@@ -3551,41 +4066,14 @@ async def receive_user_search(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_data = await run_db(search_user_sync, query_text)
 
     if not user_data:
-        await update.message.reply_text(f"❌ User `{escape_md(query_text)}` not found.\nTry another ID/Username or type /cancel.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"❌ User `{escape_md(query_text)}` not found.\nTry another ID/Username or type /cancel.",
+            parse_mode="Markdown",
+        )
         return WAIT_USER_SEARCH
 
     uid = user_data.get("user_id")
-    uname = user_data.get("username") or "No username"
-    fname = user_data.get("first_name") or "No name"
-    balance = fmt_num(user_data.get("balance", 0))
-    today = fmt_num(user_data.get("today_earned", 0))
-    total_e = fmt_num(user_data.get("total_earned", 0))
-    ref_e = fmt_num(user_data.get("refer_earned", 0))
-    total_o = user_data.get("total_otps", 0)
-    weekly_o = user_data.get("weekly_otps", 0)
-    ref_by = user_data.get("referred_by") or "None"
-    last_date = user_data.get("last_earn_date") or "N/A"
-
-    text = (
-        f"👤 <b>USER DETAILS</b>\n\n"
-        f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
-        f"👤 <b>First Name:</b> {html.escape(fname)}\n"
-        f"🏷️ <b>Username:</b> @{html.escape(uname)}\n"
-        f"💰 <b>Balance:</b> <code>{balance} ৳</code>\n"
-        f"📈 <b>Total Earned:</b> <code>{total_e} ৳</code>\n"
-        f"📅 <b>Today Earned:</b> <code>{today} ৳</code>\n"
-        f"🎁 <b>Refer Earned:</b> <code>{ref_e} ৳</code>\n"
-        f"📨 <b>Total OTPs:</b> <code>{total_o}</code>\n"
-        f"📊 <b>Weekly OTPs:</b> <code>{weekly_o}</code>\n"
-        f"🔗 <b>Referred By:</b> <code>{ref_by}</code>\n"
-        f"📅 <b>Last Earn Date:</b> <code>{last_date}</code>"
-    )
-
-    kbd = InlineKeyboardMarkup([
-        [create_button("🔍 Search Another", callback_data="adm:usr:search", style="primary")],
-        [create_button("Back to User Manager", callback_data="adm:usr:manager", style="danger")]
-    ])
-
+    text, kbd = _build_user_detail_view(uid, user_data)
     await update.message.reply_text(text, reply_markup=kbd, parse_mode="HTML")
     return ConversationHandler.END
 
@@ -3766,24 +4254,27 @@ async def admin_add_service_start(update: Update, context: ContextTypes.DEFAULT_
 @admin_only
 async def admin_add_service_with_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    service = query.data.split(":", 3)[3]
+    service = _resolve_full_key(query.data.split(":", 3)[3], list(SERVICES_CACHE.keys()))
     context.user_data['service_name'] = service
     await query.message.reply_text(
-        f"Service **{escape_md(service)}** selected.\n\nEnter country name (e.g., Bangladesh, Nepal):",
-        parse_mode="Markdown"
+        f"Service <b>{safe_html_escape(service)}</b> selected.\n\nEnter country name (e.g., Bangladesh, Nepal):",
+        parse_mode="HTML"
     )
     return ADD_COUNTRY
 
 
 async def receive_service_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['service_name'] = update.message.text.strip()
+    raw = update.message.text or ""
+    ents = update.message.entities or []
+    context.user_data['service_name'] = entities_to_tg_emoji(raw, ents).strip()
     await update.message.reply_text("Enter country name (e.g., Bangladesh, Nepal):")
     return ADD_COUNTRY
 
 
-# 🆕 MODIFIED: Ask for country short form BEFORE payout
 async def receive_country_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    country = update.message.text.strip()
+    raw = update.message.text or ""
+    ents = update.message.entities or []
+    country = entities_to_tg_emoji(raw, ents).strip()
     context.user_data['country_name'] = country
     service = context.user_data.get('service_name', '')
 
@@ -3792,24 +4283,27 @@ async def receive_country_name(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if has_custom_short:
         await update.message.reply_text(
-            f"🏳️ Country: **{escape_md(country)}**\n"
-            f"🔤 Current short form: `{escape_md(existing_short)}`\n\n"
-            f"Enter a new **short form** (e.g., `BD`, `US`, `IND`), or send `skip` to keep the current one:",
-            parse_mode="Markdown"
+            f"🏳️ Country: <b>{safe_html_escape(country)}</b>\n"
+            f"🔤 Current short form: <code>{safe_html_escape(existing_short)}</code>\n\n"
+            f"Enter a new <b>short form</b> (e.g., <code>BD</code>, <code>US</code>, <code>IND</code>), "
+            "or send <code>skip</code> to keep the current one:",
+            parse_mode="HTML"
         )
     else:
         await update.message.reply_text(
-            f"🏳️ Country: **{escape_md(country)}**\n\n"
-            f"Enter a **short form** for this country (e.g., `BD`, `US`, `IND`).\n"
+            f"🏳️ Country: <b>{safe_html_escape(country)}</b>\n\n"
+            f"Enter a <b>short form</b> for this country (e.g., <code>BD</code>, <code>US</code>, <code>IND</code>).\n"
             f"This will be shown in OTP group messages:",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     return WAIT_COUNTRY_SHORT
 
 
-# 🆕 NEW: Receive country short form, save it, then ask for payout
 async def receive_country_short(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val = update.message.text.strip()
+    raw = update.message.text or ""
+    ents = update.message.entities or []
+    val = entities_to_tg_emoji(raw, ents).strip()
+    
     country = context.user_data.get('country_name', '')
     service = context.user_data.get('service_name', '')
 
@@ -3822,15 +4316,15 @@ async def receive_country_short(update: Update, context: ContextTypes.DEFAULT_TY
     existing_payout = get_payout_sync(service, country) if service else DEFAULT_PAYOUT
     hint = ""
     if service and country in PAYOUTS_CACHE.get(service, {}):
-        hint = f"\n⚠️ This country already exists with payout `{fmt_num(existing_payout)} ৳`. Sending a new payout will overwrite it."
+        hint = f"\n⚠️ This country already exists with payout <code>{fmt_num(existing_payout)} ৳</code>. Sending a new payout will overwrite it."
 
     await update.message.reply_text(
-        f"✅ Short form set to `{escape_md(short)}`.\n\n"
-        f"💵 Enter the **payout amount (৳)** each user will receive per OTP "
-        f"for **{escape_md(service)}** → **{escape_md(country)}**.\n\n"
-        f"Default: `{fmt_num(DEFAULT_PAYOUT)} ৳` (send `default` to use this)."
+        f"✅ Short form set to {safe_html_escape(short)}.\n\n"
+        f"💵 Enter the <b>payout amount (৳)</b> each user will receive per OTP "
+        f"for <b>{safe_html_escape(service)}</b> → <b>{safe_html_escape(country)}</b>.\n\n"
+        f"Default: <code>{fmt_num(DEFAULT_PAYOUT)} ৳</code> (send <code>default</code> to use this)."
         f"{hint}",
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     return WAIT_PAYOUT_AMOUNT
 
@@ -3852,10 +4346,10 @@ async def receive_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         valid_count = await run_db(save_numbers_sync, service, country, numbers, payout)
         short = get_country_short_sync(service, country)
         await update.message.reply_text(
-            f"✅ Successfully added **{valid_count}** numbers!\n"
-            f"🏳️ Country: **{escape_md(country)}** (`{escape_md(short)}`)\n"
-            f"💰 Payout per OTP: `{fmt_num(payout)} ৳`",
-            reply_markup=get_admin_keyboard(), parse_mode="Markdown"
+            f"✅ Successfully added <b>{valid_count}</b> numbers!\n"
+            f"🏳️ Country: <b>{safe_html_escape(country)}</b> ({safe_html_escape(short)})\n"
+            f"💰 Payout per OTP: <code>{fmt_num(payout)} ৳</code>",
+            reply_markup=get_admin_keyboard(), parse_mode="HTML"
         )
     else:
         await update.message.reply_text("Incomplete data provided. Please try again.", reply_markup=get_admin_keyboard())
@@ -3938,12 +4432,10 @@ async def admin_add_captcha_panel_start(update: Update, context: ContextTypes.DE
 @admin_only
 async def admin_add_augestel_panel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['panel_flow'] = 'augestel'
-    preview_ep = _get_augestel_endpoint_url("<PANEL_ID>")
     await update.callback_query.message.reply_text(
-        "🪝 **AUGESTEL PANEL SETUP**\n\n"
-        "This panel receives OTPs via Webhook (`message.received`) without polling.\n"
-        f"🎯 **Endpoint Format:** `{preview_ep}`\n\n"
-        "**Step 1/2:** Enter the Panel Name (e.g., `Augestel Panel`):",
+        "📡 **AUGESTEL PANEL SETUP**\n\n"
+        "This panel logs into augestel.com with email and password.\n\n"
+        "**Step 1/4:** Enter the Panel Name (e.g., `Main Augestel Panel`):",
         parse_mode="Markdown"
     )
     return WAIT_PANEL_NAME
@@ -3969,103 +4461,14 @@ async def receive_panel_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     elif flow == 'augestel':
         await update.message.reply_text(
-            "**Step 2/2:** Enter your Augestel **Webhook Signing Secret** (for `X-Augestel-Signature` HMAC-SHA256 verification):",
+            "**Step 2/4:** Enter the **Panel Email**:",
             parse_mode="Markdown"
         )
-        return WAIT_AUGESTEL_SECRET
+        return WAIT_AUG_EMAIL
 
     else:
         await update.message.reply_text("Enter Base API URL (e.g., http://domain.com/viewstasx):")
         return WAIT_PANEL_URL
-
-
-async def receive_augestel_secret(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    secret = update.message.text.strip()
-    if not secret:
-        await update.message.reply_text("❌ Signing secret cannot be empty. Please enter your Augestel Webhook Signing Secret:")
-        return WAIT_AUGESTEL_SECRET
-
-    p_name = context.user_data.get('new_api_name') or "Augestel panel"
-    cfg = {
-        "_panel_type": "augestel",
-        "webhook_secret": secret,
-    }
-    pid = await run_db(
-        save_api_panel_sync,
-        p_name,
-        "webhook://augestel",
-        secret,
-        5.0,
-        json.dumps(cfg),
-    )
-
-    if pid:
-        AUGESTEL_PANEL_STATUS[str(pid)] = "🟢 Webhook Ready"
-        exact_endpoint = _get_augestel_endpoint_url(str(pid))
-        safe_pname = str(p_name).replace("`", "")
-        copy_kbd = InlineKeyboardMarkup([
-            [create_button("📋 Copy Dashboard Endpoint", copy_text=exact_endpoint, style="success")]
-        ])
-        await update.message.reply_text(
-            f"✅ **Augestel Panel Connected!**\n\n"
-            f"📌 **Name:** `{safe_pname}`\n"
-            f"🧩 **Mode:** `Webhook (No Polling)`\n"
-            f"🎯 **Set this Exact Endpoint in Augestel Dashboard:**\n"
-            f"`{exact_endpoint}`\n"
-            f"🛣️ **Method:** `POST`\n"
-            f"📡 **Event:** `message.received`",
-            reply_markup=copy_kbd,
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text("❌ Failed to save Augestel panel.")
-
-    for key in ('new_api_name', 'panel_flow'):
-        context.user_data.pop(key, None)
-
-    text_msg, kbd = await run_db(build_api_panels_view)
-    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
-    return ConversationHandler.END
-
-
-@admin_only
-async def admin_set_augestel_domain_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = update.callback_query.data
-    panel_id = data.split(":", 3)[3]
-    context.user_data['aug_domain_panel_id'] = panel_id
-    curr = _get_webhook_base_url() or "Not set"
-    await update.callback_query.message.reply_text(
-        "🌐 **SET WEBHOOK SERVER DOMAIN / BASE URL**\n\n"
-        f"Current Base URL: `{curr.replace('`', '')}`\n\n"
-        "Enter your bot server's public URL or domain (e.g., `https://bot.yourdomain.com` or `http://123.45.67.89:8080`),\n"
-        "or type `auto` to use automatic host detection:",
-        parse_mode="Markdown"
-    )
-    return WAIT_AUGESTEL_DOMAIN
-
-
-async def receive_augestel_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw_val = update.message.text.strip().rstrip("/")
-    panel_id = context.user_data.pop('aug_domain_panel_id', None)
-    if raw_val.lower() in ("auto", "reset", "clear"):
-        await run_db(set_setting, "webhook_base_url", "")
-    else:
-        if not raw_val.startswith(("http://", "https://")):
-            raw_val = f"https://{raw_val}"
-        await run_db(set_setting, "webhook_base_url", raw_val)
-
-    if panel_id:
-        exact_ep = _get_augestel_endpoint_url(str(panel_id))
-        await update.message.reply_text(
-            f"✅ **Augestel Dashboard Endpoint Updated!**\n\n`{exact_ep}`",
-            parse_mode="Markdown"
-        )
-        text_msg, kbd = await run_db(build_panel_manage_view, str(panel_id))
-        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
-    else:
-        text_msg, kbd = await run_db(build_api_panels_view)
-        await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
-    return ConversationHandler.END
 
 
 async def receive_panel_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4097,6 +4500,9 @@ async def receive_panel_interval(update: Update, context: ContextTypes.DEFAULT_T
         interval_val = 5.0
 
     context.user_data['new_api_interval'] = interval_val
+
+    if context.user_data.get('panel_flow') == 'augestel':
+        return await _save_augestel_panel(update, context)
 
     if context.user_data.get('panel_flow') == 'custom':
         await update.message.reply_text(
@@ -4272,9 +4678,6 @@ async def receive_map_cli_path(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-# ============================================================
-# 🔐 CAPTCHA PANEL SETUP — Step receivers
-# ============================================================
 async def receive_cpt_login_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['cpt_login_url'] = update.message.text.strip()
     await update.message.reply_text("**Step 3/8:** Enter the **Panel Username**:", parse_mode="Markdown")
@@ -4383,6 +4786,63 @@ async def receive_cpt_dt_col_idx(update: Update, context: ContextTypes.DEFAULT_T
     return await _save_captcha_panel(update, context)
 
 
+async def receive_aug_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['aug_email'] = update.message.text.strip()
+    await update.message.reply_text("**Step 3/4:** Enter the **Panel Password**:", parse_mode="Markdown")
+    return WAIT_AUG_PASSWORD
+
+
+async def receive_aug_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['aug_password'] = update.message.text.strip()
+    await update.message.reply_text(
+        "**Step 4/5:** Enter the **API Key** (Get it from Augestel -> SMS API -> API Credentials).\n"
+        "Example: `sk_live_...`", 
+        parse_mode="Markdown"
+    )
+    return WAIT_AUG_API_KEY
+
+async def receive_aug_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['aug_api_key'] = update.message.text.strip()
+    await update.message.reply_text("**Step 5/5:** Enter Polling Interval for API in seconds (Default: 13, Min: 13, Max: 120):", parse_mode="Markdown")
+    return WAIT_PANEL_INTERVAL
+
+async def _save_augestel_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = {
+        "_panel_type": "augestel",
+        "login_url": AUGESTEL_LOGIN_URL,
+        "dashboard_url": AUGESTEL_DASHBOARD_URL,
+        "email": context.user_data.get('aug_email', ''),
+        "password": context.user_data.get('aug_password', ''),
+        "api_key": context.user_data.get('aug_api_key', ''), # নতুন API Key
+    }
+    p_name = context.user_data.get('new_api_name', '')
+    p_interval = context.user_data.get('new_api_interval', 13.0) or 13.0
+    
+    if p_name and cfg["email"] and cfg["password"] and cfg["api_key"]:
+        pid = await run_db(
+            save_api_panel_sync,
+            p_name, AUGESTEL_LOGIN_URL, "", p_interval, json.dumps(cfg),
+        )
+        await update.message.reply_text(
+            f"✅ **Augestel Panel Added!**\n\n"
+            f"📌 Name: `{escape_md(p_name)}`\n"
+            f"👤 Email: `{escape_md(cfg['email'])}`\n"
+            f"🔑 API Key: `{mask_api_key(cfg['api_key'])}`\n"
+            f"⏱️ API Polling: `{p_interval}s`\n\n"
+            f"WebSocket will start automatically. API will act as backup.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("❌ Incomplete panel data.")
+    
+    for k in ('new_api_name', 'new_api_interval', 'panel_flow', 'aug_email', 'aug_password', 'aug_api_key'):
+        context.user_data.pop(k, None)
+    
+    text_msg, kbd = build_api_panels_view()
+    await update.message.reply_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
 async def _save_captcha_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = {
         "_panel_type": "captcha",
@@ -4432,9 +4892,6 @@ async def _save_captcha_panel(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-# ============================================================
-# 🔒 FORCE JOIN SETUP HANDLERS
-# ============================================================
 @admin_only
 async def admin_fj_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text(
@@ -4523,9 +4980,6 @@ async def handle_fj_chat_type(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-# ============================================================
-# 🎁 REFER COMMISSION PERCENT HANDLERS
-# ============================================================
 @admin_only
 async def admin_set_refer_pct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text(
@@ -4560,7 +5014,7 @@ async def set_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
-    if not (new_link.startswith("http://") or new_link.startswith("https://") or new_link.startswith("t.me/") or new_link.startswith("@")):
+    if not (new_link.startswith("http://") or new_link.startswith("https://") or new_link.startswith("t.me/") or new_link.startswith("@'") or new_link.startswith("@")):  # noqa
         await update.message.reply_text("❌ Invalid link! Please enter a valid URL or Telegram username.\nType /cancel to abort.")
         return WAIT_CHANNEL
     await run_db(set_setting, "channel", new_link)
@@ -4579,7 +5033,7 @@ async def set_support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_support_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_link = update.message.text.strip()
-    if not (new_link.startswith("http://") or new_link.startswith("https://") or new_link.startswith("t.me/") or new_link.startswith("@")):
+    if not (new_link.startswith("http://") or new_link.startswith("https://") or new_link.startswith("t.me/") or new_link.startswith("@'") or new_link.startswith("@")):  # noqa
         await update.message.reply_text("❌ Invalid username/link!\nType /cancel to abort.")
         return WAIT_SUPPORT
     await run_db(set_setting, "support", new_link)
@@ -4613,7 +5067,6 @@ async def set_otpgroupid_start(update: Update, context: ContextTypes.DEFAULT_TYP
     if update.callback_query:
         await update.callback_query.message.reply_text("Enter the OTP Forward Group Chat ID (e.g., -1001234567890):")
     return WAIT_OTP_GROUP_ID
-
 
 
 async def receive_otp_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4711,8 +5164,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'cpt_login_url', 'cpt_username', 'cpt_password', 'cpt_msg_link',
                 'cpt_num_col_name', 'cpt_num_col_idx', 'cpt_msg_col_name',
                 'cpt_msg_col_idx', 'cpt_dt_col_name', 'cpt_dt_col_idx',
-                'fj_chat_id', 'fj_chat_title', 'fj_chat_link', 'cc_length',
-                'country_short', 'aug_domain_panel_id'):
+                'fj_chat_id', 'fj_chat_title', 'fj_chat_link', 'cc_length', 'aug_email', 'aug_password',
+                'country_short'):
         context.user_data.pop(key, None)
 
     if update.message and update.message.text:
@@ -4760,6 +5213,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    if not user_is_admin and data != "fj_check":
+        if await run_db(is_user_banned_sync, user_id):
+            try:
+                await query.answer(
+                    "🚫 You are banned.\n\nPlease contact support to resolve this.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            return
+
     _skip_fj = user_is_admin or data.startswith("adm:") or data.startswith("fj_")
     if not _skip_fj and is_force_join_enabled():
         chats = get_force_join_chats()
@@ -4791,7 +5255,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not kbd:
             await query.edit_message_text(msg)
         else:
-            await query.edit_message_text(msg, reply_markup=kbd)
+            await query.edit_message_text(msg, reply_markup=kbd, parse_mode="HTML")
 
     elif data == "usr:withdraw":
         withdraw_on = get_setting("withdraw_enabled", "true") == "true"
@@ -4863,11 +5327,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons = []
         for i, ch in enumerate(chats):
             buttons.append([create_button(
-                f"❌ {ch.get('title', 'N/A')}",
+                ch.get('title', 'N/A'),
                 callback_data=f"adm:fj_rem:{i}",
-                style="danger"
+                style="danger",
+                icon_custom_emoji_id="6267000941547885720"
             )])
-        buttons.append([create_button("Back", callback_data="adm:fj_settings", style="primary")])
+        buttons.append([create_button("Back", callback_data="adm:fj_settings", style="primary", icon_custom_emoji_id="5456187398977247949")])
         await query.edit_message_text("Select a channel/group to remove:", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("adm:fj_rem:"):
@@ -4923,14 +5388,53 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text_msg, kbd = build_user_manager_view()
         await query.edit_message_text("✅ Export completed. Check the file sent above.", reply_markup=kbd, parse_mode="Markdown")
 
+    elif data.startswith("adm:usr:ban:") or data.startswith("adm:usr:unban:"):
+        if not user_is_admin: await query.answer(); return
+        parts = data.split(":", 3)
+        action = parts[2]
+        target_uid = int(parts[3])
+        if is_admin_sync(target_uid):
+            await query.answer("❌ Cannot ban/unban an admin!", show_alert=True)
+            return
+        is_banning = (action == "ban")
+        reason = "Manually banned by admin" if is_banning else ""
+        ok = await run_db(set_user_banned_sync, target_uid, is_banning, reason)
+        if ok and is_banning:
+            await _send_banned_message(context.bot, target_uid)
+        await query.answer(
+            "✅ User banned!" if is_banning else "✅ User unbanned!",
+            show_alert=True,
+        )
+        user_data = await run_db(search_user_sync, str(target_uid))
+        if user_data:
+            text, kbd = _build_user_detail_view(target_uid, user_data)
+            try:
+                await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
+            except Exception:
+                pass
+
+    elif data.startswith("adm:usr:release:"):
+        if not user_is_admin: await query.answer(); return
+        target_uid = int(data.split(":", 3)[3])
+        await query.answer("Releasing numbers...", show_alert=False)
+        count = await run_db(release_user_allocations_sync, target_uid)
+        await query.answer(f"✅ Released {count} numbers.", show_alert=True)
+        user_data = await run_db(search_user_sync, str(target_uid))
+        if user_data:
+            text, kbd = _build_user_detail_view(target_uid, user_data)
+            try:
+                await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
+            except Exception:
+                pass
+
     elif data == "adm:w_del_m_list":
         if not user_is_admin: await query.answer(); return
         await query.answer()
         methods = await run_db(get_withdraw_methods_sync)
         buttons = []
         for m in methods:
-            buttons.append([create_button(f"❌ Delete {m}", callback_data=f"adm:w_del_m:{m}", style="danger")])
-        buttons.append([create_button("Back", callback_data="adm:w_settings", style="primary")])
+            buttons.append([create_button(f"Delete {m}", callback_data=f"adm:w_del_m:{m}", style="danger", icon_custom_emoji_id="6267000941547885720")])
+        buttons.append([create_button("Back", callback_data="adm:w_settings", style="primary", icon_custom_emoji_id="5456187398977247949")])
         await query.edit_message_text("Select payment method to remove:", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("adm:w_del_m:"):
@@ -5032,8 +5536,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⚠️ **CONFIRMATION**\n\nRemove admin **{escape_md(target_name)}** (`{target_uid}`)?"
         )
         kbd = InlineKeyboardMarkup([
-            [create_button("✅ YES, REMOVE", callback_data=f"adm:del:{target_uid}", style="danger"),
-             create_button("❌ CANCEL", callback_data="adm:ctrl:list", style="primary")]
+            [create_button("YES, REMOVE", callback_data=f"adm:del:{target_uid}", style="danger", icon_custom_emoji_id="5424998570539373838"),
+             create_button("CANCEL", callback_data="adm:ctrl:list", style="primary", icon_custom_emoji_id="5456187398977247949")]
         ])
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
@@ -5076,62 +5580,118 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text_msg, kbd = build_extra_settings_view()
         await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
+    elif data == "adm:toggle:otp_format":
+        if not user_is_admin: await query.answer(); return
+        curr = get_setting("otp_group_format", "regular")
+        new_val = "premium" if curr != "premium" else "regular"
+        await run_db(set_setting, "otp_group_format", new_val)
+        await query.answer(
+            f"OTP format set to {new_val.upper()}!",
+            show_alert=True,
+        )
+        text_msg, kbd = build_extra_settings_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
     elif data == "adm:srv:list":
         if not user_is_admin: await query.answer(); return
         await query.answer()
         text, kbd = build_admin_services_view()
-        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
 
     elif data.startswith("adm:srv:view:"):
         if not user_is_admin: await query.answer(); return
         await query.answer()
-        service = data.split(":", 3)[3]
+        service = _resolve_full_key(data.split(":", 3)[3], list(SERVICES_CACHE.keys()))
         text, kbd = await run_db(build_service_manage_view, service)
-        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
 
     elif data.startswith("adm:srv:del:"):
         if not user_is_admin: await query.answer(); return
-        service = data.split(":", 3)[3]
+        service = _resolve_full_key(data.split(":", 3)[3], list(SERVICES_CACHE.keys()))
         await run_db(delete_service_db, service)
         await query.answer(f"Deleted!", show_alert=True)
         text, kbd = build_admin_services_view()
-        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
 
     elif data.startswith("adm:cnt:delli:"):
         if not user_is_admin: await query.answer(); return
         await query.answer()
-        service = data.split(":", 3)[3]
+        service = _resolve_full_key(data.split(":", 3)[3], list(SERVICES_CACHE.keys()))
         cnts = get_admin_services_summary().get(service, {})
         buttons = []
         for cnt in cnts.keys():
-            buttons.append([create_button(f"❌ Delete {cnt}", callback_data=f"adm:cnt:del:{service}:{cnt}", style="danger")])
-        buttons.append([create_button("Back", callback_data=f"adm:srv:view:{service}", style="danger")])
-        await query.edit_message_text(f"Select country to delete from **{escape_md(service)}**:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+            buttons.append([create_button(f"Delete {cnt}", callback_data=f"adm:cnt:del:{_cb_clean(service)}:{_cb_clean(cnt)}", style="danger", icon_custom_emoji_id="5422557736330106570")])
+        buttons.append([create_button("Back", callback_data=f"adm:srv:view:{_cb_clean(service)}", style="danger", icon_custom_emoji_id="5456187398977247949")])
+        await query.edit_message_text(
+            f"Select country to delete from <b>{safe_html_escape(service)}</b>:",
+            reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML"
+        )
 
     elif data.startswith("adm:cnt:del:"):
         if not user_is_admin: await query.answer(); return
         parts = data.split(":", 4)
         if len(parts) >= 5:
-            service, country = parts[3], parts[4]
+            service = _resolve_full_key(parts[3], list(SERVICES_CACHE.keys()))
+            country = _resolve_full_key(parts[4], list(SERVICES_CACHE.get(service, {}).keys()))
             await run_db(delete_country_db, service, country)
             await query.answer(f"Deleted!", show_alert=True)
             text, kbd = build_service_manage_view(service)
-            await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+            await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
         else:
             await query.answer()
 
     elif data.startswith("adm:pay:mng:"):
         if not user_is_admin: await query.answer(); return
         await query.answer()
-        service = data.split(":", 3)[3]
+        service = _resolve_full_key(data.split(":", 3)[3], list(SERVICES_CACHE.keys()))
         text, kbd = await run_db(build_payout_manage_view, service)
-        await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+        await query.edit_message_text(text, reply_markup=kbd, parse_mode="HTML")
 
     elif data == "adm:api:list":
         if not user_is_admin: await query.answer(); return
         await query.answer()
         text, kbd = build_api_panels_view()
         await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data == "adm:cliemoji:list":
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        text_msg, kbd = build_cli_emojis_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+
+    elif data == "adm:cliemoji:del_list":
+        if not user_is_admin: await query.answer(); return
+        await query.answer()
+        keys = [k for k in SETTINGS_CACHE.keys() if k.startswith("cli_emoji:")]
+        if not keys:
+            await query.answer("No CLI emojis to delete.", show_alert=True)
+            text_msg, kbd = build_cli_emojis_view()
+            await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
+            return
+        buttons = []
+        for k in keys:
+            cli_name = k.split(":", 1)[1]
+            buttons.append([create_button(
+                f"Delete {cli_name}",
+                callback_data=f"adm:cliemoji:del:{cli_name}",
+                style="danger",
+                icon_custom_emoji_id="5422557736330106570"
+            )])
+        buttons.append([create_button("Back", callback_data="adm:cliemoji:list", style="primary", icon_custom_emoji_id="5456187398977247949")])
+        await query.edit_message_text("Select CLI to remove:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("adm:cliemoji:del:"):
+        if not user_is_admin: await query.answer(); return
+        cli_name = data.split(":", 3)[3]
+        try:
+            await run_db(set_setting, f"cli_emoji:{cli_name}", "")
+            supabase.table("settings").delete().eq("key", f"cli_emoji:{cli_name}").execute()
+            SETTINGS_CACHE.pop(f"cli_emoji:{cli_name}", None)
+        except Exception as e:
+            logger.error(f"cli emoji delete error: {e}")
+        await query.answer(f"Deleted emoji for {cli_name}!", show_alert=True)
+        text_msg, kbd = build_cli_emojis_view()
+        await query.edit_message_text(text_msg, reply_markup=kbd, parse_mode="Markdown")
 
     elif data.startswith("adm:api:view:"):
         if not user_is_admin: await query.answer(); return
@@ -5142,7 +5702,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("adm:api:test:"):
         if not user_is_admin: await query.answer(); return
-        await query.answer("Testing...")
+        await query.answer("Fetching...")
         panel_id = data.split(":", 3)[3]
         p = await run_db(get_api_panel_sync, panel_id)
         if not p:
@@ -5150,50 +5710,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if get_panel_type(p) == "augestel":
-            secret = _get_augestel_secret(p)
-            sample_raw = (
-                b'{\n'
-                b'  "event": "webhook.self_test",\n'
-                b'  "timestamp": "2025-01-15T10:30:06Z"\n'
-                b'}'
-            )
-            good_sig = "sha256=" + hmac.new(secret.encode("utf-8"), sample_raw, hashlib.sha256).hexdigest()
-            with flask_app.test_client() as tc:
-                ok_res = tc.post(
-                    f"/webhook/augestel/{panel_id}",
-                    data=sample_raw,
-                    headers={
-                        "Content-Type": "application/json",
-                        "X-Augestel-Event": "webhook.self_test",
-                        "X-Augestel-Signature": good_sig,
-                        "X-Augestel-Timestamp": "2025-01-15T10:30:06Z",
-                    },
+            try:
+                cfg = json.loads(p.get("mapping_json") or "{}")
+            except Exception:
+                cfg = {}
+            await _augestel_close_session(str(panel_id))
+            ok, status = await _augestel_login(str(panel_id), p, cfg)
+            if not ok:
+                AUGESTEL_PANEL_STATUS[str(panel_id)] = status
+                kbd = InlineKeyboardMarkup([
+                    [create_button("Back", callback_data=f"adm:api:view:{panel_id}", style="primary")]
+                ])
+                await query.edit_message_text(
+                    f"❌ <b>Login Failed</b>\n\n<code>{html.escape(status)}</code>",
+                    reply_markup=kbd, parse_mode="HTML"
                 )
-                bad_res = tc.post(
-                    f"/webhook/augestel/{panel_id}",
-                    data=sample_raw,
-                    headers={
-                        "Content-Type": "application/json",
-                        "X-Augestel-Event": "webhook.self_test",
-                        "X-Augestel-Signature": "sha256=0000000000000000000000000000000000000000000000000000000000000000",
-                        "X-Augestel-Timestamp": "2025-01-15T10:30:06Z",
-                    },
+                return
+            items, fetch_status = await fetch_augestel_panel_data(str(panel_id), cfg)
+            AUGESTEL_PANEL_STATUS[str(panel_id)] = fetch_status
+            preview = ""
+            for i, it in enumerate(items[:3], 1):
+                otp_code = extract_otp(it["message"])
+                dt_preview = f" | 📅 {html.escape(str(it.get('dt', ''))[:25])}" if it.get('dt') else ""
+                preview += (
+                    f"\n<b>{i}.</b> 📱 <code>{html.escape(it['num'])}</code>{dt_preview}\n"
+                    f"   💬 <code>{html.escape(it['message'][:150])}</code>\n"
+                    f"   🔐 OTP: <code>{html.escape(otp_code)}</code>\n"
                 )
-            endpoint_display = _get_augestel_endpoint_url(str(panel_id))
-            sig_ok = (ok_res.status_code == 200 and bad_res.status_code == 401)
+            if not preview:
+                preview = f"\n<i>No OTP rows found.</i>\n<b>Debug info:</b>\n• Email: <code>{html.escape(str(cfg.get('email', '')))}</code>\n• Check credentials and that the panel has messages in the last 1 day.\n"
             kbd = InlineKeyboardMarkup([
-                [create_button("📋 Copy Dashboard Endpoint", copy_text=endpoint_display, style="success")],
-                [create_button("Back to Panel", callback_data=f"adm:api:view:{panel_id}", style="primary")]
+                [create_button("Back", callback_data=f"adm:api:view:{panel_id}", style="primary")]
             ])
             await query.edit_message_text(
-                f"🧪 <b>AUGESTEL WEBHOOK SELF-TEST — {html.escape(p['name'])}</b>\n\n"
-                f"• Valid HMAC Signature Test: <code>HTTP {ok_res.status_code}</code>\n"
-                f"• Tampered Signature Reject: <code>HTTP {bad_res.status_code}</code>\n"
-                f"• Verification Result: <b>{'✅ PASSED' if sig_ok else '❌ FAILED'}</b>\n"
-                f"• Dashboard Endpoint: <code>{html.escape(endpoint_display)}</code>\n"
-                f"• Total Received: <b>{AUGESTEL_PANEL_COUNTS.get(str(panel_id), 0)}</b>",
-                reply_markup=kbd,
-                parse_mode="HTML",
+                f"✅ <b>Login OK</b>\n"
+                f"Status: <code>{html.escape(fetch_status)}</code>\n"
+                f"Total fetched: <b>{len(items)}</b>\n"
+                f"{preview}",
+                reply_markup=kbd, parse_mode="HTML"
             )
             return
 
@@ -5306,6 +5860,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("adm:api:relogin:"):
         if not user_is_admin: await query.answer(); return
         panel_id = data.split(":", 3)[3]
+        p = await run_db(get_api_panel_sync, panel_id)
+        if p and get_panel_type(p) == "augestel":
+            await _augestel_close_session(str(panel_id))
+            AUGESTEL_PANEL_STATUS[str(panel_id)] = "🔄 Re-login triggered"
+            await query.answer("Session cleared. Will re-login shortly.", show_alert=True)
+            text, kbd = build_panel_manage_view(str(panel_id))
+            await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
+            return
         old = CAPTCHA_SESSIONS.pop(str(panel_id), None)
         if old:
             try: await old["client"].aclose()
@@ -5323,8 +5885,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if p:
             text = f"⚠️ Delete panel **'{escape_md(p['name'])}'**?"
             kbd = InlineKeyboardMarkup([
-                [create_button("✅ YES", callback_data=f"adm:api:del:{panel_id}", style="danger"),
-                 create_button("❌ CANCEL", callback_data=f"adm:api:view:{panel_id}", style="primary")]
+                [create_button("YES", callback_data=f"adm:api:del:{panel_id}", style="danger", icon_custom_emoji_id="5424998570539373838"),
+                 create_button("CANCEL", callback_data=f"adm:api:view:{panel_id}", style="primary", icon_custom_emoji_id="6267000941547885720")]
             ])
             await query.edit_message_text(text, reply_markup=kbd, parse_mode="Markdown")
 
@@ -5338,7 +5900,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("srv_"):
         await query.answer()
-        service = data.split("_", 1)[1]
+        clean_service = data.split("_", 1)[1]
+        all_services = list(SERVICES_CACHE.keys())
+        service = _resolve_full_key(clean_service, all_services)
         countries = get_countries_for_service(service)
         if not countries:
             await query.edit_message_text("No countries available.")
@@ -5349,15 +5913,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i in range(0, len(countries), 2):
             country_a = countries[i]
             label_a = f"{country_a} ({SERVICES_CACHE.get(service, {}).get(country_a, 0)})" if show_country_count else country_a
-            row = [create_button(label_a, callback_data=f"cnt_{service}_{country_a}", style="primary")]
+            row = [create_button(label_a, callback_data=f"cnt_{_cb_clean(service)}_{_cb_clean(country_a)}", style="primary")]
             if i + 1 < len(countries):
                 country_b = countries[i + 1]
                 label_b = f"{country_b} ({SERVICES_CACHE.get(service, {}).get(country_b, 0)})" if show_country_count else country_b
-                row.append(create_button(label_b, callback_data=f"cnt_{service}_{country_b}", style="primary"))
+                row.append(create_button(label_b, callback_data=f"cnt_{_cb_clean(service)}_{_cb_clean(country_b)}", style="primary"))
             buttons.append(row)
 
-        buttons.append([create_button("Back", callback_data="back_to_services", style="danger")])
-        await query.edit_message_text(f"📍 Select country for {escape_md(service)}:", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+        buttons.append([create_button("Back", callback_data="back_to_services", style="danger", icon_custom_emoji_id="5456187398977247949")])
+        await query.edit_message_text(
+            f'<tg-emoji emoji-id="5352922460897452503">📍</tg-emoji> Select country for {safe_html_escape(service)}:',
+            reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML"
+    )
 
     elif data.startswith("cnt_"):
         await query.answer()
@@ -5365,7 +5932,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) < 3:
             await query.edit_message_text("Invalid command.")
             return
-        service, country = parts[1], parts[2]
+        service_clean, country_clean = parts[1], parts[2]
+        all_services = list(SERVICES_CACHE.keys())
+        service = _resolve_full_key(service_clean, all_services)
+        if service in SERVICES_CACHE:
+            country = _resolve_full_key(country_clean, list(SERVICES_CACHE[service].keys()))
+        else:
+            country = country_clean
+
+        if not user_is_admin:
+            ok, wait_s = _check_number_cooldown(user_id)
+            if not ok:
+                await query.answer(
+                    f"⏳ Please wait {wait_s}s before getting a new number.",
+                    show_alert=True,
+                )
+                return
+        _LAST_NUMBER_CLAIM[user_id] = time.monotonic()
+
         target_qty = int(get_setting("number_quantity", "2") or 2)
         assigned_numbers = await run_db(allocate_numbers_sync, service, country, user_id, target_qty)
         if not assigned_numbers:
@@ -5377,17 +5961,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['last_country'] = country
 
         hide_cc = await run_db(get_user_hide_cc_sync, user_id)
-        alloc_msg = "━━━━━━━━━━━━━━━\n" + f"{escape_md(service)} ➜ {escape_md(country)}'s Numbers:"
+        alloc_msg = f"━━━━━━━━━━━━━━━\n{safe_html_escape(service)} ➜ {safe_html_escape(country)}'s Numbers:"
         kbd = build_allocation_keyboard(service, country, assigned_numbers, hide_cc=hide_cc)
-        await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
+        await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="HTML")
 
     elif data.startswith("togcc:"):
         await query.answer()
         parts = data.split(":", 3)
         if len(parts) >= 4:
-            service = parts[1]
-            country = parts[2]
+            service_clean = parts[1]
+            country_clean = parts[2]
             hide_cc = (parts[3] == "1")
+            all_services = list(SERVICES_CACHE.keys())
+            service = _resolve_full_key(service_clean, all_services)
+            if service in SERVICES_CACHE:
+                country = _resolve_full_key(country_clean, list(SERVICES_CACHE[service].keys()))
+            else:
+                country = country_clean
 
             numbers = context.user_data.get('last_allocated_numbers')
             if not numbers or context.user_data.get('last_service') != service or context.user_data.get('last_country') != country:
@@ -5404,11 +5994,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await run_db(set_user_hide_cc_sync, user_id, hide_cc)
 
-            alloc_msg = "━━━━━━━━━━━━━━━\n" + f"{escape_md(service)} ➜ {escape_md(country)}'s Numbers:"
+            alloc_msg = f"━━━━━━━━━━━━━━━\n{safe_html_escape(service)} ➜ {safe_html_escape(country)}'s Numbers:"
             kbd = build_allocation_keyboard(service, country, numbers, hide_cc=hide_cc)
 
             try:
-                await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
+                await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="HTML")
             except Exception:
                 pass
             await query.answer("Country code hidden!" if hide_cc else "Country code shown!")
@@ -5418,7 +6008,45 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) < 3:
             await query.answer("Invalid request!", show_alert=True)
             return
-        service, country = parts[1], parts[2]
+        service_clean, country_clean = parts[1], parts[2]
+        all_services = list(SERVICES_CACHE.keys())
+        service = _resolve_full_key(service_clean, all_services)
+        if service in SERVICES_CACHE:
+            country = _resolve_full_key(country_clean, list(SERVICES_CACHE[service].keys()))
+        else:
+            country = country_clean
+
+        if not user_is_admin:
+            ok, wait_s = _check_number_cooldown(user_id)
+            if not ok:
+                await query.answer(
+                    f"⏳ Please wait {wait_s}s before changing numbers.",
+                    show_alert=True,
+                )
+                return
+
+            should_ban, change_count = _record_change_and_check_ban(user_id)
+            if should_ban:
+                await run_db(
+                    set_user_banned_sync, user_id, True,
+                    f"Auto-ban: {change_count} changes in {int(NUMBER_CHANGE_WINDOW)}s",
+                )
+                _RECENT_NUMBER_CHANGES.pop(user_id, None)
+                _LAST_NUMBER_CLAIM.pop(user_id, None)
+
+                name = query.from_user.full_name or query.from_user.username or f"User {user_id}"
+                await _notify_admins_ban(
+                    context, user_id, name,
+                    f"{change_count} number changes in {int(NUMBER_CHANGE_WINDOW)}s",
+                )
+                await _send_banned_message(context.bot, user_id)
+                await query.answer(
+                    "🚫 You have been banned for number abuse.", show_alert=True,
+                )
+                return
+
+        _LAST_NUMBER_CLAIM[user_id] = time.monotonic()
+
         target_qty = int(get_setting("number_quantity", "2") or 2)
         old_numbers = await run_db(get_user_allocations_sync, user_id, service, country)
         new_numbers = await run_db(allocate_numbers_sync, service, country, user_id, target_qty, old_numbers)
@@ -5430,9 +6058,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['last_country'] = country
 
             hide_cc = await run_db(get_user_hide_cc_sync, user_id)
-            alloc_msg = "━━━━━━━━━━━━━━━\n" + f"{escape_md(service)} ➜ {escape_md(country)}'s Numbers:"
+            alloc_msg = f"━━━━━━━━━━━━━━━\n{safe_html_escape(service)} ➜ {safe_html_escape(country)}'s Numbers:"
             kbd = build_allocation_keyboard(service, country, new_numbers, hide_cc=hide_cc)
-            await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="Markdown")
+            await query.edit_message_text(alloc_msg, reply_markup=kbd, parse_mode="HTML")
         else:
             await query.answer(f"Not enough new numbers!", show_alert=True)
 
@@ -5474,17 +6102,176 @@ def _filter_new_items(items: list, processed_ids: TimedLRUDict) -> Tuple[list, l
     return valid, new_ids
 
 
-# ============================================================
-# 🆕 process_otp_items_fast — NEW OTP Group message format
-#    Format:
-#        {ShortCountry} › {CLI Name}
-#
-#        ☎️ Number: {masked}
-#        ━━━━━━━━━━━━━━━━━
-#        [🗨️ SMS: {message}]   (if show_message on)
-#        ━━━━━━━━━━━━━━━━━
-#        🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {name} ({link})
-# ============================================================
+def _build_premium_otp_html(
+    short_country: str,
+    full_country: str,
+    service: str,
+    number: str,
+    otp_code: str,
+    full_message: str,
+    channel_link: str,
+    bot_link: str,
+    show_dev: bool,
+    dev_name: str,
+    dev_link: str,
+    show_msg: bool,
+    cli_emoji: str = "",
+) -> str:
+    prefix_mask, number_mask = mask_number_premium(number)
+    
+    # 🆕 ইমোজি রিমুভ করা হলো
+    clean_full_country = strip_all_emojis(full_country)
+
+    # Premium Emoji IDs
+    e_country = '<tg-emoji emoji-id="5375177250553487549">🏳️</tg-emoji>'
+    e_number = '<tg-emoji emoji-id="5404435834789187002">📞</tg-emoji>'
+    e_otp = '<tg-emoji emoji-id="5472239203590888751">💬</tg-emoji>'
+    e_copy = '<tg-emoji emoji-id="5778137984276632041">🔑</tg-emoji>'
+    e_channel = '<tg-emoji emoji-id="5296639349729800444">📢</tg-emoji>'
+    e_bot = '<tg-emoji emoji-id="4940635119791637363">🤖</tg-emoji>'
+
+    # Header (Table 1)
+    header_content = f"<b>{safe_html_escape(short_country)}</b> {cli_emoji} <b>{safe_html_escape(service)}</b>"
+    header_table = f"<table compact><tr><td align=\"center\">{header_content}</td></tr></table>"
+
+    # Data (Table 2)
+    data_table = (
+        "<table bordered striped>"
+        f"<tr><td>{e_country} COUNTRY</td><td><code>{html.escape(clean_full_country)}</code></td></tr>"
+        f"<tr><td>{e_number} NUMBER</td><td><code>{html.escape(number_mask)}</code></td></tr>"
+        f"<tr><td>{e_otp} OTP</td><td><code>{html.escape(otp_code)}</code></td></tr>"
+        "</table>"
+    )
+
+    parts: List[str] = [header_table, data_table]
+
+    # Message Button (Copies full message)
+    if show_msg:
+        label_text = full_message.replace("\n", " ").strip()
+        btn_label = label_text[:60] + "..." if len(label_text) > 60 else label_text
+        copy_text_esc = html.escape(full_message, quote=True)
+        
+        parts.append("<tg-button-row>")
+        parts.append(
+            f"<tg-button type=\"copy_text\" style=\"success\" "
+            f"text=\"{copy_text_esc}\">"
+            f"{e_copy} {html.escape(btn_label)}</tg-button>"
+        )
+        parts.append("</tg-button-row>")
+
+    # Channel & Number Buttons
+    parts.append("<tg-button-row>")
+    parts.append(f"<tg-button type=\"url\" style=\"primary\" url=\"{html.escape(channel_link, quote=True)}\">{e_channel} CHANNEL</tg-button>")
+    parts.append(f"<tg-button type=\"url\" style=\"primary\" url=\"{html.escape(bot_link, quote=True)}\">{e_bot} NUMBER</tg-button>")
+    parts.append("</tg-button-row>")
+
+    # Developer Button
+    if show_dev and dev_name and dev_link:
+        parts.append("<tg-button-row>")
+        parts.append(
+            f"<tg-button type=\"url\" style=\"primary\" url=\"{html.escape(dev_link, quote=True)}\">"
+            f"🖥️ DEVELOPER: {html.escape(dev_name.upper())}</tg-button>"
+        )
+        parts.append("</tg-button-row>")
+
+    return "".join(parts)
+
+
+def _build_premium_dm_html(
+    short_country: str,
+    full_country: str,
+    service: str,
+    number: str,
+    otp_code: str,
+    full_message: str,
+    payout_str: str,
+    bal_str: str,
+    show_msg: bool,
+    cli_emoji: str = "",
+) -> str:
+    # 🆕 ইমোজি রিমুভ করা হলো
+    clean_full_country = strip_all_emojis(full_country)
+
+    # Premium Emoji IDs
+    e_country = '<tg-emoji emoji-id="5375177250553487549">🏳️</tg-emoji>'
+    e_number = '<tg-emoji emoji-id="5404435834789187002">📞</tg-emoji>'
+    e_added = '<tg-emoji emoji-id="6206375377925839184">➕</tg-emoji>'
+    e_balance = '<tg-emoji emoji-id="5417924076503062111">💳</tg-emoji>'
+    e_copy = '<tg-emoji emoji-id="5778137984276632041">🔑</tg-emoji>'
+
+    # Header: Service - Short Name
+    header_content = f"<b>{safe_html_escape(short_country)}</b> {cli_emoji} <b>{safe_html_escape(service)}</b>"
+    header_table = f"<table compact><tr><td align=\"center\">{header_content}</td></tr></table>"
+
+    # Data Table (🆕 এখানে number_mask এর জায়গায় ফুল number বসানো হলো)
+    data_table = (
+        "<table bordered striped>"
+        f"<tr><td>{e_country} COUNTRY</td><td><code>{html.escape(clean_full_country)}</code></td></tr>"
+        f"<tr><td>{e_number} NUMBER</td><td><code>{html.escape(number)}</code></td></tr>"
+        f"<tr><td>{e_added} ADDED</td><td><code>{payout_str} BDT</code></td></tr>"
+        f"<tr><td>{e_balance} BALANCE</td><td><code>{bal_str} BDT</code></td></tr>"
+        "</table>"
+    )
+
+    parts: List[str] = [header_table, data_table]
+
+    # Copy Button (Label = Full Message, Copies = OTP Code)
+    if show_msg:
+        label_text = otp_code
+        btn_label = label_text[:60] + "..." if len(label_text) > 60 else label_text
+        copy_code_esc = html.escape(otp_code, quote=True)
+        
+        parts.append("<tg-button-row>")
+        parts.append(
+            f"<tg-button type=\"copy_text\" style=\"success\" "
+            f"text=\"{copy_code_esc}\">"
+            f"{e_copy} {html.escape(btn_label)}</tg-button>"
+        )
+        parts.append("</tg-button-row>")
+
+    return "".join(parts)
+    
+def _build_regular_otp_html(
+    short_country: str,
+    service: str,
+    number: str,
+    otp_code: str,
+    full_message: str,
+    channel_link: str,
+    bot_link: str,
+    show_msg: bool,
+    show_dev: bool,
+    dev_name: str,
+    dev_link: str,
+    copy_keyboard,
+) -> str:
+    """Legacy regular text — returns HTML body; caller adds reply_markup."""
+    safe_short = safe_html_escape(short_country)
+    safe_service = safe_html_escape(service)
+    safe_masked = html.escape(mask_number_aph(number))
+    safe_msg = html.escape(full_message)
+
+    if show_msg:
+        body = (
+            f"<b>{safe_short}</b> › <b>{safe_service}</b>\n\n"
+            f"☎️ Number: {safe_masked}\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"🗨️ SMS:\n"
+            f"<blockquote expandable>{safe_msg}</blockquote>\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+        )
+    else:
+        body = (
+            f"<b>{safe_short}</b> › {safe_service}\n\n"
+            f"☎️ Number: {safe_masked}\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+        )
+    if show_dev:
+        dev_html = f'<a href="{dev_link}">{html.escape(dev_name)}</a>'
+        body += f"🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {dev_html}"
+    return body
+
+
 async def process_otp_items_fast(items: list, application: Application):
     if not items:
         return
@@ -5496,9 +6283,9 @@ async def process_otp_items_fast(items: list, application: Application):
     show_dev_enabled = get_setting("show_developer", "true") == "true"
     dev_username = get_setting("dev_username", "developer")
     dev_link = clean_tg_link(get_setting("dev_link", "https://t.me/developer"))
-    # 🆕 Developer display: clickable name + visible link in parens
-    dev_html = f'<a href="{dev_link}">{html.escape(dev_username)}</a>'
     target_otp_group = get_setting("otp_group_id", OTP_GROUP_ID)
+    otp_format = get_setting("otp_group_format", "regular")
+    premium_mode = (otp_format == "premium")
 
     numbers = [str(it.get("num", "")).strip() for it in items]
     clean_numbers = [re.sub(r'\D', '', n) for n in numbers]
@@ -5575,83 +6362,119 @@ async def process_otp_items_fast(items: list, application: Application):
             cli = (item.get("cli") or "").strip()
             display_service = cli if cli else (alloc.get("service") or "Service")
 
-            # 🆕 Short country name from settings (falls back to full country)
             short_country = get_country_short_sync(alloc["service"], alloc["country"])
+            full_country = alloc.get("country", "Unknown")
 
             otp_code = extract_otp(msg)
             safe_msg = html.escape(msg)
-            safe_service = html.escape(display_service)
-            safe_short = html.escape(short_country)
+            safe_service = safe_html_escape(display_service)
+            safe_short = safe_html_escape(short_country)
             safe_num = html.escape(num)
             safe_masked_num = html.escape(mask_number_aph(num))
             payout_str = fmt_num(item_payout)
 
-            # ── OTP Group message (NEW FORMAT) ──
+            # 🆕 CLI Emoji Lookup
+            clean_name = re.sub(r'<tg-emoji.*?>.*?</tg-emoji>', '', display_service)
+            cli_clean = remove_emojis(clean_name).strip().lower()
+            
+            cli_emoji_id = get_setting(f"cli_emoji:{cli_clean}", "")
+            cli_emoji_html = (
+                f'<tg-emoji emoji-id="{cli_emoji_id}">🎲</tg-emoji>'
+                if cli_emoji_id else ""
+            )
+
+            # ── OTP Group message ──
             if target_otp_group:
-                divider = "━━━━━━━━━━━━━━━━━"
+                if premium_mode:
+                    premium_html = _build_premium_otp_html(
+                        short_country=short_country,
+                        full_country=full_country,
+                        service=display_service,
+                        number=num,
+                        otp_code=otp_code,
+                        full_message=msg,
+                        channel_link=ch_link,
+                        bot_link=bot_link,
+                        show_dev=show_dev_enabled,
+                        dev_name=dev_username,
+                        dev_link=dev_link,
+                        show_msg=show_msg_enabled,
+                        cli_emoji=cli_emoji_html,
+                    )
+                    send_tasks.append(_safe_send_rich(application.bot, target_otp_group, premium_html))
+                else:
+                    group_text = _build_regular_otp_html(
+                        short_country=short_country,
+                        service=display_service,
+                        number=num,
+                        otp_code=otp_code,
+                        full_message=msg,
+                        channel_link=ch_link,
+                        bot_link=bot_link,
+                        show_msg=show_msg_enabled,
+                        show_dev=show_dev_enabled,
+                        dev_name=dev_username,
+                        dev_link=dev_link,
+                        copy_keyboard=None,
+                    )
+                    group_kbd = InlineKeyboardMarkup([
+                        [create_button("Channel", url=ch_link, style="primary"),
+                         create_button("Get Number", url=bot_link, style="primary")],
+                        [create_button(f"{otp_code}", copy_text=otp_code, style="success")]
+                    ])
+                    send_tasks.append(_safe_send(
+                        application.bot, target_otp_group,
+                        text=group_text, reply_markup=group_kbd,
+                        parse_mode="HTML",
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    ))
+
+            # ── User DM message ──
+            if premium_mode:
+                dm_html = _build_premium_dm_html(
+                    short_country=short_country,
+                    full_country=full_country,
+                    service=display_service,
+                    number=num,
+                    otp_code=otp_code,
+                    full_message=msg,
+                    payout_str=payout_str,
+                    bal_str=bal_str,
+                    show_msg=show_msg_enabled,
+                    cli_emoji=cli_emoji_html,
+                )
+                send_tasks.append(_safe_send_rich(application.bot, u, dm_html))
+            else:
                 if show_msg_enabled:
-                    group_text = (
-                        f"<b>{safe_short}</b> › <b>{safe_service}</b>\n\n"
-                        f"☎️ Number: {safe_masked_num}\n"
-                        f"{divider}\n"
-                        f"🗨️ SMS:\n"
+                    user_text = (
+                        "— — — — — — — — — —\n"
+                        f"<blockquote>📱 SERVICE: {safe_service}</blockquote>\n"
+                        f"<blockquote>📞 NUMBER: {safe_num}</blockquote>\n"
+                        f"<blockquote>➕ ADDED  ➜ {payout_str} BDT</blockquote>\n"
+                        f"<blockquote>💳 BALANCE ➜ {bal_str} BDT</blockquote>\n"
+                        "🗨️ MESSAGE: \n"
                         f"<blockquote expandable>{safe_msg}</blockquote>\n"
-                        f"{divider}\n"
+                        "— — — — — — — — — —"
                     )
                 else:
-                    group_text = (
-                        f"<b>{safe_short}</b> › {safe_service}\n\n"
-                        f"☎️ Number: {safe_masked_num}\n"
-                        f"{divider}\n"
+                    user_text = (
+                        "— — — — — — — — — —\n"
+                        f"<blockquote>📱 SERVICE: {safe_service}</blockquote>\n"
+                        f"<blockquote>📞 NUMBER: {safe_num}</blockquote>\n"
+                        f"<blockquote>➕ ADDED  ➜ {payout_str} BDT</blockquote>\n"
+                        f"<blockquote>💳 BALANCE ➜ {bal_str} BDT</blockquote>\n"
+                        "— — — — — — — — — —"
                     )
-
-                if show_dev_enabled:
-                    group_text += f"🖥️ Dᴇᴠᴇʟᴏᴘᴇʀ {dev_html}"
-
-                group_kbd = InlineKeyboardMarkup([
-                    [create_button("Channel", url=ch_link, style="primary"),
-                     create_button("Get Number", url=bot_link, style="primary")],
+                user_kbd = InlineKeyboardMarkup([
                     [create_button(f"{otp_code}", copy_text=otp_code, style="success")]
                 ])
                 send_tasks.append(_safe_send(
-                    application.bot, target_otp_group,
-                    text=group_text, reply_markup=group_kbd,
-                    parse_mode="HTML",
-                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    application.bot, u,
+                    text=user_text, reply_markup=user_kbd, parse_mode="HTML",
                 ))
-
-            # ── User DM message (unchanged) ──
-            if show_msg_enabled:
-                user_text = (
-                    "— — — — — — — — — —\n"
-                    f"<blockquote>📱 SERVICE: {safe_service}</blockquote>\n"
-                    f"<blockquote>📞 NUMBER: {safe_num}</blockquote>\n"
-                    f"<blockquote>➕ ADDED  ➜ {payout_str} TK</blockquote>\n"
-                    f"<blockquote>💳 BALANCE ➜ {bal_str} TK</blockquote>\n"
-                    "🗨️ MESSAGE: \n"
-                    f"<blockquote expandable>{safe_msg}</blockquote>\n"
-                    "— — — — — — — — — —"
-                )
-            else:
-                user_text = (
-                    "— — — — — — — — — —\n"
-                    f"<blockquote>📱 SERVICE: {safe_service}</blockquote>\n"
-                    f"<blockquote>📞 NUMBER: {safe_num}</blockquote>\n"
-                    f"<blockquote>➕ ADDED  ➜ {payout_str} TK</blockquote>\n"
-                    f"<blockquote>💳 BALANCE ➜ {bal_str} TK</blockquote>\n"
-                    "— — — — — — — — — —"
-                )
-            user_kbd = InlineKeyboardMarkup([
-                [create_button(f"{otp_code}", copy_text=otp_code, style="success")]
-            ])
-            send_tasks.append(_safe_send(
-                application.bot, u,
-                text=user_text, reply_markup=user_kbd, parse_mode="HTML",
-            ))
 
     if send_tasks:
         await asyncio.gather(*send_tasks, return_exceptions=True)
-
 
 async def poll_single_panel(panel_id: str, application: Application,
                             processed_ids: TimedLRUDict):
@@ -5669,9 +6492,6 @@ async def poll_single_panel(panel_id: str, application: Application,
             if not panel:
                 await asyncio.sleep(5)
                 continue
-
-            if get_panel_type(panel) == "augestel":
-                return
 
             url = panel["url"]
             token = panel["token"]
@@ -5732,6 +6552,50 @@ async def poll_single_panel(panel_id: str, application: Application,
                                     logger.exception(f"process_otp_items_fast CRASHED: {e}")
                             asyncio.create_task(_safe_process_cpt(new_items, application))
 
+                await asyncio.sleep(interval)
+                continue
+
+            if get_panel_type(panel) == "augestel":
+                try:
+                    cfg = json.loads(panel.get("mapping_json") or "{}")
+                except Exception:
+                    cfg = {}
+                sess = AUGESTEL_SESSIONS.get(panel_id)
+                if not sess:
+                    ok, status = await _augestel_login(panel_id, panel, cfg)
+                    AUGESTEL_PANEL_STATUS[panel_id] = status
+                    if not ok:
+                        logger.info(f"Augestel panel {panel_id}: {status}")
+                        await asyncio.sleep(30)
+                        continue
+                items, status = await fetch_augestel_panel_data(panel_id, cfg)
+                AUGESTEL_PANEL_STATUS[panel_id] = status
+                status_lower = status.lower()
+                if ("expired" in status_lower
+                        or "error" in status_lower
+                        or "not json" in status_lower
+                        or "empty response" in status_lower):
+                    await _augestel_close_session(panel_id)
+                    logger.info(f"Augestel panel {panel_id}: {status} - forcing re-login")
+                    await asyncio.sleep(3)
+                    continue
+                if items:
+                    new_items, new_ids = _filter_new_items(items, processed_ids)
+                    if new_items:
+                        logger.info(f"Augestel Panel {panel_id}: {len(new_items)} new items - delivering")
+                        try:
+                            await run_db(mark_otp_seen_batch_sync, new_ids)
+                        except Exception as e:
+                            for mid in new_ids:
+                                processed_ids.pop(mid, None)
+                            logger.error(f"mark_otp_seen failed, rolled back {len(new_ids)}: {e}")
+                        else:
+                            async def _safe_process_aug(it, app):
+                                try:
+                                    await process_otp_items_fast(it, app)
+                                except Exception as e:
+                                    logger.exception(f"process_otp_items_fast CRASHED: {e}")
+                            asyncio.create_task(_safe_process_aug(new_items, application))
                 await asyncio.sleep(interval)
                 continue
 
@@ -5818,22 +6682,13 @@ async def poll_single_panel(panel_id: str, application: Application,
 
 
 async def otp_poller_manager(application: Application):
-    global _SHARED_PROCESSED_IDS
-    if _SHARED_PROCESSED_IDS is not None:
-        processed_ids = _SHARED_PROCESSED_IDS
-    else:
-        processed_ids = TimedLRUDict(maxsize=PROCESSED_IDS_MAX, ttl=OTP_ID_RETENTION_SECONDS)
-        _SHARED_PROCESSED_IDS = processed_ids
-    try:
-        loaded = await run_db(load_seen_otp_ids_sync) or {}
-        for mid, ts in loaded.items():
-            try:
-                processed_ids.add(mid, ts=float(ts) if ts else None)
-            except Exception:
-                processed_ids.add(mid)
-    finally:
-        if _POLLER_READY_EVENT is not None:
-            _POLLER_READY_EVENT.set()
+    loaded = await run_db(load_seen_otp_ids_sync) or {}
+    processed_ids = TimedLRUDict(maxsize=PROCESSED_IDS_MAX, ttl=OTP_ID_RETENTION_SECONDS)
+    for mid, ts in loaded.items():
+        try:
+            processed_ids.add(mid, ts=float(ts) if ts else None)
+        except Exception:
+            processed_ids.add(mid)
     logger.info(f"OTP Poller Manager started. Loaded {len(processed_ids)} seen OTP ids.")
 
     cycle_count = 0
@@ -5842,8 +6697,7 @@ async def otp_poller_manager(application: Application):
     while True:
         try:
             panels = await run_db(get_all_api_panels_sync)
-            polling_panels = [p for p in panels if get_panel_type(p) != "augestel"]
-            active_ids = {str(p["id"]) for p in polling_panels}
+            active_ids = {str(p["id"]) for p in panels}
 
             for pid in list(PANEL_TASKS.keys()):
                 if pid not in active_ids or PANEL_TASKS[pid].done():
@@ -5851,7 +6705,7 @@ async def otp_poller_manager(application: Application):
                         PANEL_TASKS[pid].cancel()
                     del PANEL_TASKS[pid]
 
-            for p in polling_panels:
+            for p in panels:
                 pid = str(p["id"])
                 if pid not in PANEL_TASKS or PANEL_TASKS[pid].done():
                     PANEL_TASKS[pid] = asyncio.create_task(
@@ -5907,7 +6761,7 @@ def main():
     application = (
         Application.builder()
         .token(TOKEN)
-        .concurrent_updates(False)
+        .concurrent_updates(16)
         .build()
     )
 
@@ -5919,7 +6773,6 @@ def main():
             CallbackQueryHandler(admin_add_custom_panel_start, pattern="^adm:api:add_custom$"),
             CallbackQueryHandler(admin_add_captcha_panel_start, pattern="^adm:api:add_captcha$"),
             CallbackQueryHandler(admin_add_augestel_panel_start, pattern="^adm:api:add_augestel$"),
-            CallbackQueryHandler(admin_set_augestel_domain_start, pattern="^adm:api:aug_domain:"),
             CallbackQueryHandler(admin_add_admin_start, pattern="^adm:add:start$"),
             CallbackQueryHandler(set_channel_start, pattern="^adm:set:channel$"),
             CallbackQueryHandler(set_support_start, pattern="^adm:set:support$"),
@@ -5938,12 +6791,12 @@ def main():
             CallbackQueryHandler(admin_fj_add_start, pattern="^adm:fj_add$"),
             CallbackQueryHandler(admin_set_refer_pct_start, pattern="^adm:refer_set_pct$"),
             CallbackQueryHandler(admin_search_user_start, pattern="^adm:usr:search$"),
+            CallbackQueryHandler(admin_cliemoji_add_start, pattern="^adm:cliemoji:add$"),  # 🆕
             MessageHandler(filters.Regex("(?i)^Broadcast$"), broadcast_start),
         ],
         states={
             ADD_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_service_name)],
             ADD_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_country_name)],
-            # 🆕 NEW: country short form is asked right after country name
             WAIT_COUNTRY_SHORT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_country_short)],
             WAIT_PAYOUT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_payout_amount)],
             WAIT_CC_LENGTH: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_cc_length)],
@@ -5970,8 +6823,6 @@ def main():
             WAIT_CPT_MSG_COL_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_cpt_msg_col_idx)],
             WAIT_CPT_DT_COL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_cpt_dt_col_name)],
             WAIT_CPT_DT_COL_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_cpt_dt_col_idx)],
-            WAIT_AUGESTEL_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_augestel_secret)],
-            WAIT_AUGESTEL_DOMAIN: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_augestel_domain)],
             WAIT_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_admin_id)],
             WAIT_ADMIN_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_admin_name)],
             WAIT_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_channel_link)],
@@ -5995,6 +6846,11 @@ def main():
             WAIT_FJ_CHAT_TYPE: [CallbackQueryHandler(handle_fj_chat_type, pattern="^adm:fj_type:")],
             WAIT_REFER_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_refer_pct)],
             WAIT_USER_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_user_search)],
+            # 🆕 CLI Emoji States
+            WAIT_CLI_EMOJI_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_cli_emoji_name)],
+            WAIT_AUG_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_aug_email)],
+            WAIT_AUG_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, receive_aug_password)],
+            WAIT_CLI_EMOJI_VAL: [MessageHandler(~filters.COMMAND & ~MENU_FILTER, receive_cli_emoji_val)],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
@@ -6010,16 +6866,10 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_callback))
 
     async def post_init(app: Application):
-        global _MAIN_LOOP, _BOT_APP, _POLLER_READY_EVENT, _SHARED_PROCESSED_IDS
-        _MAIN_LOOP = asyncio.get_running_loop()
-        _BOT_APP = app
-        _POLLER_READY_EVENT = asyncio.Event()
-        _SHARED_PROCESSED_IDS = TimedLRUDict(maxsize=PROCESSED_IDS_MAX, ttl=OTP_ID_RETENTION_SECONDS)
         try:
             await _get_bot_info(app, ttl=0.0)
         except Exception:
             pass
-        await _detect_public_ip_once()
 
         t1 = asyncio.create_task(otp_poller_manager(app))
         t2 = asyncio.create_task(firebase_backup_worker())
@@ -6048,6 +6898,12 @@ def main():
             except Exception:
                 pass
         CAPTCHA_SESSIONS.clear()
+        for pid in list(AUGESTEL_SESSIONS.keys()):
+            try:
+                await _augestel_close_session(pid)
+            except Exception:
+                pass
+        AUGESTEL_SESSIONS.clear()
         try:
             await asyncio.to_thread(push_dirty_to_firebase_sync)
             logger.info("Final Firebase backup complete")
